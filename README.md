@@ -3,6 +3,7 @@
 See and control what's playing on Spotify without leaving [herdr](https://herdr.dev):
 
 - **Player pane**: track, artist, album, progress, volume, shuffle/repeat, with keyboard controls
+- **Search**: find tracks, albums, artists and playlists and play them, from the pane or the CLI
 - **Agents panel**: the player pane shows up as an agent, titled with the current track
 - **CLI**: `nowplaying next`, `nowplaying now`, … for scripts and key bindings
 
@@ -89,6 +90,8 @@ nowplaying popup      open the player as a popup
 nowplaying play       play/pause            nowplaying next | prev   skip
 nowplaying now        print what's playing  nowplaying web           open track in Spotify
 nowplaying here       move playback to the spotify_player device
+nowplaying search <query>          list tracks, albums, artists, playlists
+nowplaying search --play <query>   play the top track
 nowplaying daemon     start the spotify_player daemon
 ```
 
@@ -104,6 +107,11 @@ Without the symlink, every command is also a plugin action:
 | `←` / `→` | seek ∓10s | `w` | open track in Spotify |
 | `+` / `-` | volume | `t` | play on the spotify_player device |
 | `o` | start the player/app | `q` | close the pane (music keeps playing) |
+| `/` | search | | |
+
+In search results: `↑`/`↓` (or `j`/`k`) select, `Tab`/`←`/`→` switch category, `Enter` plays the
+track, album, artist or playlist, `/` searches again, `Esc` goes back. Search needs the
+`spotify_player` backend; with the Spotify app backend, `/` opens the app's own search.
 
 ### Key bindings
 

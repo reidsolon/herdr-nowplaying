@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.parse
 
 PLUGIN_ID = os.environ.get("HERDR_PLUGIN_ID", "reidsolon.nowplaying")
 CONFIG_DIR = os.environ.get("HERDR_PLUGIN_CONFIG_DIR") or os.path.expanduser(f"~/.config/herdr/plugins/config/{PLUGIN_ID}")
@@ -134,6 +135,35 @@ class SpotifyPlayerBackend:
             f.seek(max(0, os.path.getsize(logs[-1]) - 4000))
             return any(b"429 Too Many Requests" in line for line in f.read().splitlines()[-2:])
 
+    def search(self, query):
+        """Returns {category: [{"kind", "id", "title", "sub"}]} for tracks, albums, artists and playlists,
+        or None if the request failed (rate limit, timeout, daemon unreachable)."""
+        try:
+            d = json.loads(self.cli("search", query) or "null")
+        except json.JSONDecodeError:
+            d = None
+        if not isinstance(d, dict):
+            return None
+        names = lambda artists: ", ".join(a.get("name", "") for a in artists or [])
+        return {
+            "Tracks": [{"kind": "track", "id": t["id"], "title": t["name"],
+                        "sub": f"{names(t.get('artists'))} · {(t.get('album') or {}).get('name', '')}"}
+                       for t in d.get("tracks", [])],
+            "Albums": [{"kind": "album", "id": a["id"], "title": a["name"],
+                        "sub": f"{names(a.get('artists'))} · {a.get('release_date', '')[:4]}"}
+                       for a in d.get("albums", [])],
+            "Artists": [{"kind": "artist", "id": a["id"], "title": a["name"], "sub": ""}
+                        for a in d.get("artists", [])],
+            "Playlists": [{"kind": "playlist", "id": p["id"], "title": p["name"], "sub": p.get("desc", "")}
+                          for p in d.get("playlists", [])],
+        }
+
+    def play_item(self, item):
+        if item["kind"] == "track":
+            self.cli("playback", "start", "track", "--id", item["id"])
+        else:
+            self.cli("playback", "start", "context", "--id", item["id"], item["kind"])
+
     def command(self, action, amount=0):
         pb = ["playback"]
         argv = {
@@ -171,6 +201,8 @@ class AppleScriptBackend:
       return (player state as string) & "{SEP}" & (name of t) & "{SEP}" & (artist of t) & "{SEP}" & (album of t) & "{SEP}" & (duration of t) & "{SEP}" & (player position) & "{SEP}" & (sound volume) & "{SEP}" & (shuffling) & "{SEP}" & (repeating) & "{SEP}" & (spotify url of t)
     end tell
     '''
+
+    search = None  # the desktop app has no search API; the UI opens the app's search instead
 
     def tell(self, cmd):
         return run(["osascript", "-e", f'if application "Spotify" is running then tell application "Spotify" to {cmd}'])
@@ -293,7 +325,7 @@ def draw(win, s, backend):
         put(win, 2, 2, f"{what} isn't running.  [o] start it   [q] quit")
         return
     if s["state"] == "NO_TRACK":
-        msg = f"Nothing playing.  [t] play on {backend.device_name}   [q] quit" if backend.name == "spotify_player" \
+        msg = f"Nothing playing.  [/] search   [t] play on {backend.device_name}   [q] quit" if backend.name == "spotify_player" \
             else "Nothing queued.  [space] play   [q] quit"
         put(win, 2, 2, msg)
         return
@@ -313,7 +345,7 @@ def draw(win, s, backend):
 
     flags = f"vol {s['volume']:>3}%   shuffle {'on ' if s['shuffle'] else 'off'}   repeat {s['repeat']}"
     put(win, 9, 2, flags, dim)
-    hints = ["space play/pause", "n/p next/prev", "←/→ seek", "+/- vol", "s shuffle", "r repeat",
+    hints = ["space play/pause", "/ search", "n/p next/prev", "←/→ seek", "+/- vol", "s shuffle", "r repeat",
              "w open in Spotify"]
     if backend.name == "spotify_player" and s["device"] != backend.device_name:
         hints.append(f"t play on {backend.device_name}")
@@ -341,7 +373,141 @@ KEYS = {
 }
 
 
+def lone_escape(stdscr, drop_paste=False):
+    """Call after reading ESC. Swallows the rest of an escape sequence and returns True only for a
+    real Esc key press. Terminals (and herdr) wrap pasted text in ESC[200~ ... ESC[201~; with
+    drop_paste the pasted text is discarded too, so it can't trigger single-key shortcuts."""
+    stdscr.nodelay(True)
+    try:
+        first = stdscr.getch()
+        if first == -1:
+            return True
+        seq = ""
+        if first in (ord("["), ord("O")):
+            while True:  # CSI/SS3: parameters until a final byte (letter or ~)
+                ch = stdscr.getch()
+                if ch == -1:
+                    break
+                seq += chr(ch)
+                if chr(ch).isalpha() or ch == ord("~"):
+                    break
+        if drop_paste and seq == "200~":
+            tail, deadline = "", time.monotonic() + 2
+            while not tail.endswith("\x1b[201~") and time.monotonic() < deadline:
+                ch = stdscr.getch()
+                if ch != -1:
+                    tail = (tail + chr(ch))[-6:]
+        return False
+    finally:
+        stdscr.timeout(500)
+
+
+def read_query(stdscr, prompt):
+    """Single-line input on the bottom row. Returns the text, or None on Esc."""
+    h, w = stdscr.getmaxyx()
+    text = ""
+    curses.curs_set(1)
+    try:
+        while True:
+            stdscr.move(h - 1, 0)
+            stdscr.clrtoeol()
+            line = f"{prompt}{text}"[-(w - 3):]
+            put(stdscr, h - 1, 2, line, curses.A_BOLD)
+            stdscr.move(h - 1, min(w - 2, 2 + len(line)))
+            stdscr.refresh()
+            try:
+                ch = stdscr.get_wch()
+            except curses.error:
+                continue
+            if ch == "\x1b":
+                if lone_escape(stdscr):
+                    return None
+                continue
+            if ch in ("\n", "\r", curses.KEY_ENTER):
+                return text.strip() or None
+            if ch in ("\x7f", "\b", curses.KEY_BACKSPACE):
+                text = text[:-1]
+            elif ch == "\x15":  # ctrl+u clears
+                text = ""
+            elif isinstance(ch, str) and ch.isprintable():
+                text += ch
+    finally:
+        curses.curs_set(0)
+
+
+def search_screen(stdscr, backend):
+    """Search Spotify and play a result. Returns True if something was started."""
+    query = read_query(stdscr, "search: ")
+    if not query:
+        return False
+    if not backend.search:
+        open_url("spotify:search:" + urllib.parse.quote(query))
+        return False
+
+    accent = curses.color_pair(1) | curses.A_BOLD
+    dim = curses.A_DIM
+    stdscr.erase()
+    put(stdscr, 0, 2, "♫ Search · Spotify", accent)
+    put(stdscr, 2, 2, f"searching for “{query}”…", dim)
+    stdscr.refresh()
+    results = backend.search(query)
+    failed = results is None
+    results = results or {}
+    tabs = [t for t in ("Tracks", "Albums", "Artists", "Playlists") if results.get(t)]
+    tab, sel, top = 0, 0, 0
+
+    while True:
+        h, w = stdscr.getmaxyx()
+        stdscr.erase()
+        put(stdscr, 0, 2, f"♫ Search · Spotify  “{query}”", accent)
+        if not tabs:
+            msg = "Search failed (Spotify may be rate-limiting)." if failed else "No results."
+            put(stdscr, 2, 2, f"{msg}  [/] search again   [esc] back")
+        else:
+            x = 2
+            for i, name in enumerate(tabs):
+                label = f" {name} ({len(results[name])}) "
+                put(stdscr, 1, x, label, curses.A_REVERSE if i == tab else dim)
+                x += len(label) + 1
+            items = results[tabs[tab]]
+            rows_per = 2
+            visible = max(1, (h - 5) // rows_per)
+            top = min(max(top, sel - visible + 1), sel)
+            for row, item in enumerate(items[top:top + visible]):
+                i = top + row
+                y = 3 + row * rows_per
+                marker = "›" if i == sel else " "
+                put(stdscr, y, 2, f"{marker} {item['title']}", curses.A_BOLD if i == sel else 0)
+                if item["sub"]:
+                    put(stdscr, y + 1, 4, item["sub"], dim)
+            put(stdscr, h - 1, 2, "↑/↓ select  tab category  enter play  / new search  esc back", dim)
+        stdscr.refresh()
+
+        k = stdscr.getch()
+        if k == 27 and not lone_escape(stdscr, drop_paste=True):
+            continue
+        if k in (27, ord("q")):
+            return False
+        if k == ord("/"):
+            return search_screen(stdscr, backend)
+        if not tabs:
+            continue
+        items = results[tabs[tab]]
+        if k in (curses.KEY_DOWN, ord("j")):
+            sel = min(len(items) - 1, sel + 1)
+        elif k in (curses.KEY_UP, ord("k")):
+            sel = max(0, sel - 1)
+        elif k in (ord("\t"), curses.KEY_RIGHT, ord("l")):
+            tab, sel, top = (tab + 1) % len(tabs), 0, 0
+        elif k in (curses.KEY_BTAB, curses.KEY_LEFT, ord("h")):
+            tab, sel, top = (tab - 1) % len(tabs), 0, 0
+        elif k in (10, 13, curses.KEY_ENTER):
+            backend.play_item(items[sel])
+            return True
+
+
 def ui(stdscr):
+    curses.set_escdelay(25)
     curses.curs_set(0)
     curses.use_default_colors()
     curses.init_pair(1, curses.COLOR_GREEN, -1)
@@ -377,10 +543,18 @@ def loop(stdscr, backend, reporter):
         stdscr.refresh()
 
         k = stdscr.getch()
-        if k in (ord("q"), 27):
+        if k == 27:
+            lone_escape(stdscr, drop_paste=True)  # ignore escape sequences and pasted text; q quits
+            continue
+        if k == ord("q"):
             return
         if k == ord("w"):
             open_url(s.get("url"))
+        elif k == ord("/"):
+            if search_screen(stdscr, backend):
+                time.sleep(0.5)
+                fetched, fetched_at = backend.status(), time.monotonic()
+                fetched_at -= max(0, backend.poll_seconds - 1)
         elif k in KEYS:
             action, amount = KEYS[k]
             if action == "volume":
@@ -406,6 +580,8 @@ USAGE = """usage: nowplaying [command]
   here            move playback to the spotify_player device
   now             print what's playing
   web             open the current track in Spotify
+  search [--play] <query>
+                  search Spotify (spotify_player); --play starts the top track
   daemon          start the spotify_player daemon if it isn't running"""
 
 
@@ -461,6 +637,32 @@ def main():
             open_url(s["url"])
         else:
             print(f"{state_icon(s)} {s['name']} — {s['artist']}  [{fmt(s['position'])}/{fmt(s['duration'])}] on {s['device']}")
+    elif cmd == "search":
+        args = sys.argv[2:]
+        play = "--play" in args
+        query = " ".join(a for a in args if a != "--play").strip()
+        if not query:
+            sys.exit("usage: nowplaying search [--play] <query>")
+        backend = pick_backend()
+        if not backend.search:
+            open_url("spotify:search:" + urllib.parse.quote(query))
+            return
+        results = backend.search(query)
+        if results is None:
+            sys.exit("search failed (Spotify may be rate-limiting); try again")
+        tracks = results.get("Tracks", [])
+        if play:
+            if not tracks:
+                sys.exit("no tracks found")
+            backend.play_item(tracks[0])
+            print(f"▶ {tracks[0]['title']} — {tracks[0]['sub']}")
+            return
+        for name in ("Tracks", "Albums", "Artists", "Playlists"):
+            items = results.get(name, [])[:5]
+            if items:
+                print(name)
+                for item in items:
+                    print(f"  {item['title']}" + (f"  —  {item['sub']}" if item["sub"] else ""))
     elif cmd in ("playpause", "next", "previous", "transfer"):
         pick_backend().command(cmd)
     else:
