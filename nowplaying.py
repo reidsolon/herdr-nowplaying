@@ -13,10 +13,12 @@ import curses
 import glob
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 
@@ -124,6 +126,8 @@ class SpotifyPlayerBackend:
             "repeat": d.get("repeat_state", "off"),
             "device": device.get("name", ""),
             "url": (item.get("external_urls") or {}).get("spotify", ""),
+            "id": item.get("id", ""),
+            "context": (d.get("context") or {}).get("uri", ""),
         }
 
     def rate_limited_since(self, since):
@@ -230,6 +234,8 @@ class AppleScriptBackend:
             "repeat": "on" if rep == "true" else "off",
             "device": self.device_name,
             "url": uri,
+            "id": uri.rsplit(":", 1)[-1],
+            "context": "",
         }
 
     def command(self, action, amount=0):
@@ -278,7 +284,11 @@ class AgentReporter:
             subprocess.run([self.herdr, "pane", subcommand, self.pane, *args], capture_output=True)
 
     def update(self, s):
-        if s["state"] in ("playing", "paused"):
+        if s["state"] == "LOADING":
+            return
+        if s.get("starting"):
+            title = f"… {s['name']}"
+        elif s["state"] in ("playing", "paused"):
             title = f"{state_icon(s)} {s['name']} — {s['artist']}"
         elif s["state"] == "NO_TRACK":
             title = "nothing playing"
@@ -320,6 +330,9 @@ def draw(win, s, backend):
     # Attribution: Spotify metadata is always shown alongside the Spotify name.
     put(win, 0, 2, "♫ Now Playing · Spotify", accent)
 
+    if s["state"] == "LOADING":
+        put(win, 2, 2, "connecting…", dim)
+        return
     if s["state"] == "NOT_RUNNING":
         what = "The spotify_player daemon" if backend.name == "spotify_player" else "The Spotify app"
         put(win, 2, 2, f"{what} isn't running.  [o] start it   [q] quit")
@@ -331,17 +344,20 @@ def draw(win, s, backend):
         return
 
     put(win, 1, 2, f"on {s['device']}", dim)
-    put(win, 3, 2, f"{state_icon(s)}  {s['name']}", curses.A_BOLD)
+    put(win, 3, 2, f"{'…' if s.get('starting') else state_icon(s)}  {s['name']}", curses.A_BOLD)
     put(win, 4, 5, s["artist"])
     put(win, 5, 5, s["album"], dim)
 
-    bar_w = max(10, w - 18)
-    frac = min(1.0, s["position"] / s["duration"]) if s["duration"] else 0
-    filled = int(bar_w * frac)
-    put(win, 7, 2, fmt(s["position"]), dim)
-    put(win, 7, 8, "━" * filled, accent)
-    put(win, 7, 8 + filled, "─" * (bar_w - filled), dim)
-    put(win, 7, 9 + bar_w, fmt(s["duration"]), dim)
+    if s.get("starting"):
+        put(win, 7, 2, "starting…", accent)
+    else:
+        bar_w = max(10, w - 18)
+        frac = min(1.0, s["position"] / s["duration"]) if s["duration"] else 0
+        filled = int(bar_w * frac)
+        put(win, 7, 2, fmt(s["position"]), dim)
+        put(win, 7, 8, "━" * filled, accent)
+        put(win, 7, 8 + filled, "─" * (bar_w - filled), dim)
+        put(win, 7, 9 + bar_w, fmt(s["duration"]), dim)
 
     flags = f"vol {s['volume']:>3}%   shuffle {'on ' if s['shuffle'] else 'off'}   repeat {s['repeat']}"
     put(win, 9, 2, flags, dim)
@@ -436,13 +452,13 @@ def read_query(stdscr, prompt):
 
 
 def search_screen(stdscr, backend):
-    """Search Spotify and play a result. Returns True if something was started."""
+    """Search Spotify. Returns the result the user picked, or None."""
     query = read_query(stdscr, "search: ")
     if not query:
-        return False
+        return None
     if not backend.search:
         open_url("spotify:search:" + urllib.parse.quote(query))
-        return False
+        return None
 
     accent = curses.color_pair(1) | curses.A_BOLD
     dim = curses.A_DIM
@@ -487,7 +503,7 @@ def search_screen(stdscr, backend):
         if k == 27 and not lone_escape(stdscr, drop_paste=True):
             continue
         if k in (27, ord("q")):
-            return False
+            return None
         if k == ord("/"):
             return search_screen(stdscr, backend)
         if not tabs:
@@ -502,8 +518,133 @@ def search_screen(stdscr, backend):
         elif k in (curses.KEY_BTAB, curses.KEY_LEFT, ord("h")):
             tab, sel, top = (tab - 1) % len(tabs), 0, 0
         elif k in (10, 13, curses.KEY_ENTER):
-            backend.play_item(items[sel])
-            return True
+            return items[sel]
+
+
+class Session:
+    """Polls status and runs commands on background threads, so the UI never waits on Spotify.
+
+    Playing a search result is optimistic: the pane shows it as "starting" right away, then
+    confirms Spotify actually switched to it and retries once if not (e.g. spotify_player
+    reconnected under a new device id and its first request 404'd)."""
+
+    def __init__(self, backend):
+        self.backend = backend
+        self.lock = threading.Lock()
+        self.status, self.status_at = {"state": "LOADING"}, time.monotonic()
+        self.pending = None  # {"item": ...} while a play is being confirmed
+        self.notice, self.notice_until = "", 0
+        self.wake = threading.Event()
+        self.jobs = queue.Queue()
+        threading.Thread(target=self._poll, daemon=True).start()
+        threading.Thread(target=self._work, daemon=True).start()
+
+    # background threads
+
+    def _store(self, status):
+        with self.lock:
+            self.status, self.status_at = status, time.monotonic()
+
+    def _poll(self):
+        while True:
+            self._store(self.backend.status())
+            self.wake.wait(self.backend.poll_seconds)
+            self.wake.clear()
+
+    def _work(self):
+        while True:
+            job = self.jobs.get()
+            try:
+                job()
+            except Exception as e:  # keep the worker alive; surface the problem in the pane
+                self.say(f"Error: {e}")
+
+    def refresh(self, delay=0.0):
+        if delay:
+            threading.Timer(delay, self.wake.set).start()
+        else:
+            self.wake.set()
+
+    def say(self, text, seconds=5):
+        with self.lock:
+            self.notice, self.notice_until = text, time.monotonic() + seconds
+
+    # actions
+
+    def command(self, action, amount=0):
+        with self.lock:
+            s, now = self.status, time.monotonic()
+            if action == "playpause" and s.get("state") in ("playing", "paused"):
+                position = s["position"] + (now - self.status_at if s["state"] == "playing" else 0)
+                self.status = dict(s, state="paused" if s["state"] == "playing" else "playing", position=position)
+                self.status_at = now
+            elif action == "volume" and "volume" in s:
+                self.status = dict(s, volume=max(0, min(100, amount)))
+
+        def job():
+            sent = time.time()
+            self.backend.command(action, amount)
+            time.sleep(0.3)
+            if getattr(self.backend, "rate_limited_since", lambda _: False)(sent):
+                self.say("Spotify rate-limited that request (429). Try again shortly.")
+            self.refresh()
+            self.refresh(1.5)  # Spotify often still reports the old track right after a change
+        self.jobs.put(job)
+
+    def play(self, item):
+        # Own thread, so confirming never delays other keys; a newer play supersedes an older one.
+        with self.lock:
+            prev_id = self.status.get("id")
+            self.pending = pending = {"item": item}
+        threading.Thread(target=self._play_confirmed, args=(item, prev_id, pending), daemon=True).start()
+
+    @staticmethod
+    def _confirms(item, s, prev_id):
+        if item["kind"] == "track":
+            return s.get("id") == item["id"]
+        return item["id"] in s.get("context", "") or (s.get("state") == "playing" and s.get("id") not in ("", prev_id))
+
+    def _play_confirmed(self, item, prev_id, pending):
+        current = lambda: self.pending is pending
+        for _attempt in range(2):
+            if not current():
+                return
+            self.backend.play_item(item)
+            for _check in range(2):
+                time.sleep(1.5)
+                s = self.backend.status()
+                with self.lock:
+                    if self.pending is not pending:
+                        return
+                    self.status, self.status_at = s, time.monotonic()
+                    if self._confirms(item, s, prev_id):
+                        self.pending = None
+                        return
+        with self.lock:
+            if self.pending is not pending:
+                return
+            self.pending = None
+        self.say(f"Couldn't start “{item['title']}”: Spotify didn't switch. Try again.", 8)
+
+    # what the UI shows
+
+    def view(self):
+        now = time.monotonic()
+        with self.lock:
+            s, at, pending = dict(self.status), self.status_at, self.pending
+            notice = self.notice if now < self.notice_until else ""
+        if pending:
+            item = pending["item"]
+            if item["kind"] == "track":
+                artist, _, album = item["sub"].partition(" · ")
+            else:
+                artist, album = item["kind"], item["sub"]
+            s = {"state": "playing", "starting": True, "name": item["title"], "artist": artist, "album": album,
+                 "duration": 0, "position": 0, "volume": s.get("volume", 0), "shuffle": s.get("shuffle", False),
+                 "repeat": s.get("repeat", "off"), "device": s.get("device", ""), "url": "", "id": item["id"]}
+        elif s.get("state") == "playing":
+            s["position"] = min(s["duration"], s["position"] + now - at)
+        return s, notice
 
 
 def ui(stdscr):
@@ -512,7 +653,7 @@ def ui(stdscr):
     curses.use_default_colors()
     curses.init_pair(1, curses.COLOR_GREEN, -1)
     curses.init_pair(2, curses.COLOR_YELLOW, -1)
-    stdscr.timeout(500)
+    stdscr.timeout(250)
 
     reporter = AgentReporter()
     try:
@@ -522,23 +663,19 @@ def ui(stdscr):
 
 
 def loop(stdscr, backend, reporter):
-    notice, notice_until = "", 0
-    fetched = backend.status()
-    fetched_at = time.monotonic()
+    session = Session(backend)
+    ended_id = None
     while True:
-        now = time.monotonic()
-        # Interpolate progress between polls; refetch on schedule or when the track should have ended.
-        s = dict(fetched)
-        if s["state"] == "playing":
-            s["position"] = min(s["duration"], s["position"] + now - fetched_at)
-        track_over = s["state"] == "playing" and s["position"] >= s["duration"]
-        if now - fetched_at >= backend.poll_seconds or track_over:
-            fetched, fetched_at = backend.status(), time.monotonic()
-            continue
+        s, notice = session.view()
+        # Refetch once when the current track should have ended.
+        if s.get("state") == "playing" and not s.get("starting") and s["position"] >= s["duration"] \
+                and s.get("id") != ended_id:
+            ended_id = s.get("id")
+            session.refresh(0.5)
 
         reporter.update(s)
         draw(stdscr, s, backend)
-        if notice and now < notice_until:
+        if notice:
             put(stdscr, stdscr.getmaxyx()[0] - 1, 2, notice, curses.color_pair(2) | curses.A_BOLD)
         stdscr.refresh()
 
@@ -551,22 +688,14 @@ def loop(stdscr, backend, reporter):
         if k == ord("w"):
             open_url(s.get("url"))
         elif k == ord("/"):
-            if search_screen(stdscr, backend):
-                time.sleep(0.5)
-                fetched, fetched_at = backend.status(), time.monotonic()
-                fetched_at -= max(0, backend.poll_seconds - 1)
+            item = search_screen(stdscr, backend)
+            if item:
+                session.play(item)
         elif k in KEYS:
             action, amount = KEYS[k]
             if action == "volume":
                 amount += s.get("volume", 0)  # absolute target, clamped by the backend
-            sent = time.time()
-            backend.command(action, amount)
-            time.sleep(0.3)
-            if getattr(backend, "rate_limited_since", lambda _: False)(sent):
-                notice, notice_until = "Spotify rate-limited that request (429). Try again shortly.", now + 4
-            fetched, fetched_at = backend.status(), time.monotonic()
-            # Spotify often still reports the old track right after a change; check again in ~1s.
-            fetched_at -= max(0, backend.poll_seconds - 1)
+            session.command(action, amount)
 
 
 # --- CLI ---------------------------------------------------------------------------------------
