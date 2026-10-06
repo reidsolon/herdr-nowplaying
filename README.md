@@ -72,13 +72,16 @@ playback). macOS will ask once to let herdr control Spotify.
    bitrate = 160
    ```
 
-4. **Log in once** and start the daemon:
+4. **Log in once.** Open the player (`nowplaying`) and press `a`, or run:
 
    ```sh
-   spotify_player authenticate
-   nowplaying daemon
+   nowplaying login    # opens your browser, then starts the daemon
    nowplaying here     # move playback to the "herdr" device
    ```
+
+   The player notices when you're logged out (first run, a new client ID, an expired token) and
+   asks you to log in instead of failing silently. `spotify_player` keeps two logins (streaming and
+   Web API) and opens one browser tab per step; steps you've approved before finish on their own.
 
 ## Usage
 
@@ -92,6 +95,7 @@ nowplaying now        print what's playing  nowplaying web           open track 
 nowplaying here       move playback to the spotify_player device
 nowplaying search <query>          list tracks, albums, artists, playlists
 nowplaying search --play <query>   play the top track
+nowplaying login      log in to Spotify in your browser, then start the daemon
 nowplaying daemon     start the spotify_player daemon
 ```
 
@@ -173,6 +177,9 @@ This plugin collects nothing and makes no network requests of its own.
 - **Paused at 0:00 after a while**: `spotify_player` lost its connection to Spotify and reconnected
   paused. Run `nowplaying play`.
 - **"player not running"**: `nowplaying daemon` (Option B), or open the Spotify app (Option A).
+- **"Not logged in to Spotify"**: press `a` in the player or run `nowplaying login`. If the browser
+  shows `INVALID_CLIENT: Invalid redirect URI`, add exactly `http://127.0.0.1:8989/login` to your
+  app's Redirect URIs in the Spotify dashboard.
 - **Logs**: `~/.cache/spotify-player/*.log`, `herdr plugin log list`.
 
 ## License

@@ -81,6 +81,9 @@ def open_url(url):
         subprocess.run(["open" if sys.platform == "darwin" else "xdg-open", url], capture_output=True)
 
 
+NCSPOT_CLIENT_ID = "d420a117a32841c2b3474932e49fb54b"  # spotify_player's default Web API client
+
+
 class SpotifyPlayerBackend:
     """Talks to a `spotify_player -d` daemon. Each status call is a Spotify Web API request,
     so callers poll sparingly and interpolate progress locally."""
@@ -92,6 +95,9 @@ class SpotifyPlayerBackend:
         self.bin = binary
         sp_config = parse_toml(os.path.expanduser("~/.config/spotify-player/app.toml"))
         self.device_name = (sp_config.get("device") or {}).get("name", "spotify-player")
+        self.client_id = sp_config.get("client_id") or NCSPOT_CLIENT_ID
+        self.cache_dir = os.path.expanduser("~/.cache/spotify-player")
+        self.login_proc = None
 
     def cli(self, *args):
         return run([self.bin, *args])
@@ -99,11 +105,45 @@ class SpotifyPlayerBackend:
     def daemon_running(self):
         return subprocess.run(["pgrep", "-f", "spotify_player -d"], capture_output=True).returncode == 0
 
+    def missing_logins(self):
+        """spotify_player keeps two logins: librespot credentials for streaming and a Web API token
+        per client id. Either one missing means it can't work until the user logs in."""
+        missing = []
+        if not os.path.exists(os.path.join(self.cache_dir, "credentials.json")):
+            missing.append("streaming")
+        if not os.path.exists(os.path.join(self.cache_dir, f"{self.client_id}_token.json")):
+            missing.append("Web API")
+        return missing
+
+    def login(self, on_url=lambda url: None):
+        """Runs `spotify_player authenticate`, which opens a browser tab per login and waits for the
+        redirect to 127.0.0.1. Returns True once everything is logged in and the daemon is up."""
+        # A daemon started without a login sits on the callback port waiting for one; stop it first.
+        subprocess.run(["pkill", "-f", "spotify_player -d"], capture_output=True)
+        self.login_proc = subprocess.Popen([self.bin, "authenticate"], stdin=subprocess.DEVNULL,
+                                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for line in self.login_proc.stdout:
+            m = re.search(r"Browse to: (\S+)", line)
+            if m:
+                on_url(m.group(1))
+        ok = self.login_proc.wait() == 0 and not self.missing_logins()
+        self.login_proc = None
+        if ok:
+            self.start()
+        return ok
+
+    def cancel_login(self):
+        if self.login_proc:
+            self.login_proc.terminate()
+
     def start(self):
-        if not self.daemon_running():
+        if not self.daemon_running() and not self.missing_logins():
             subprocess.run([self.bin, "-d"], capture_output=True)
 
     def status(self):
+        missing = self.missing_logins()
+        if missing:
+            return {"state": "NOT_AUTHENTICATED", "missing": missing}
         if not self.daemon_running():
             return {"state": "NOT_RUNNING"}
         try:
@@ -207,6 +247,10 @@ class AppleScriptBackend:
     '''
 
     search = None  # the desktop app has no search API; the UI opens the app's search instead
+    login = None   # the desktop app handles its own login
+
+    def missing_logins(self):
+        return []
 
     def tell(self, cmd):
         return run(["osascript", "-e", f'if application "Spotify" is running then tell application "Spotify" to {cmd}'])
@@ -286,7 +330,9 @@ class AgentReporter:
     def update(self, s):
         if s["state"] == "LOADING":
             return
-        if s.get("starting"):
+        if s["state"] in ("NOT_AUTHENTICATED", "AUTHENTICATING"):
+            title = "logging in…" if s["state"] == "AUTHENTICATING" else "not logged in"
+        elif s.get("starting"):
             title = f"… {s['name']}"
         elif s["state"] in ("playing", "paused"):
             title = f"{state_icon(s)} {s['name']} — {s['artist']}"
@@ -332,6 +378,16 @@ def draw(win, s, backend):
 
     if s["state"] == "LOADING":
         put(win, 2, 2, "connecting…", dim)
+        return
+    if s["state"] == "NOT_AUTHENTICATED":
+        put(win, 2, 2, "Not logged in to Spotify.", curses.A_BOLD)
+        put(win, 3, 2, f"spotify_player needs your {' and '.join(s['missing'])} login.", dim)
+        put(win, 5, 2, "[a] log in with your browser   [q] quit")
+        return
+    if s["state"] == "AUTHENTICATING":
+        put(win, 2, 2, "Approve the login in your browser…", curses.A_BOLD)
+        put(win, 3, 2, "Already-approved steps finish on their own; one tab may open per step.", dim)
+        put(win, 5, 2, "[w] open the login page again   [esc] cancel")
         return
     if s["state"] == "NOT_RUNNING":
         what = "The spotify_player daemon" if backend.name == "spotify_player" else "The Spotify app"
@@ -533,6 +589,7 @@ class Session:
         self.lock = threading.Lock()
         self.status, self.status_at = {"state": "LOADING"}, time.monotonic()
         self.pending = None  # {"item": ...} while a play is being confirmed
+        self.authenticating = None  # {"url": ...} while a browser login is in progress
         self.notice, self.notice_until = "", 0
         self.wake = threading.Event()
         self.jobs = queue.Queue()
@@ -626,13 +683,45 @@ class Session:
             self.pending = None
         self.say(f"Couldn't start “{item['title']}”: Spotify didn't switch. Try again.", 8)
 
+    def login(self):
+        if self.authenticating or not self.backend.login:
+            return
+        self.authenticating = {"url": ""}
+
+        def set_url(url):
+            with self.lock:
+                if self.authenticating:
+                    self.authenticating = {"url": url}
+
+        def job():
+            ok = False
+            try:
+                ok = self.backend.login(on_url=set_url)
+            finally:
+                with self.lock:
+                    cancelled = self.authenticating is None
+                    self.authenticating = None
+            if ok:
+                self.say("Logged in to Spotify.")
+            elif not cancelled:
+                self.say("Login didn't finish. Press a to try again.", 8)
+            self.refresh()
+        threading.Thread(target=job, daemon=True).start()
+
+    def cancel_login(self):
+        with self.lock:
+            self.authenticating = None
+        self.backend.cancel_login()
+
     # what the UI shows
 
     def view(self):
         now = time.monotonic()
         with self.lock:
-            s, at, pending = dict(self.status), self.status_at, self.pending
+            s, at, pending, auth = dict(self.status), self.status_at, self.pending, self.authenticating
             notice = self.notice if now < self.notice_until else ""
+        if auth:
+            return {"state": "AUTHENTICATING", "url": auth["url"]}, notice
         if pending:
             item = pending["item"]
             if item["kind"] == "track":
@@ -681,10 +770,20 @@ def loop(stdscr, backend, reporter):
 
         k = stdscr.getch()
         if k == 27:
-            lone_escape(stdscr, drop_paste=True)  # ignore escape sequences and pasted text; q quits
+            # Esc cancels a login in progress; other escape sequences and pasted text are ignored.
+            if lone_escape(stdscr, drop_paste=True) and s["state"] == "AUTHENTICATING":
+                session.cancel_login()
             continue
         if k == ord("q"):
+            if s["state"] == "AUTHENTICATING":
+                session.cancel_login()
             return
+        if s["state"] in ("NOT_AUTHENTICATED", "AUTHENTICATING"):
+            if k == ord("a"):
+                session.login()
+            elif k == ord("w"):
+                open_url(s.get("url"))
+            continue
         if k == ord("w"):
             open_url(s.get("url"))
         elif k == ord("/"):
@@ -711,6 +810,7 @@ USAGE = """usage: nowplaying [command]
   web             open the current track in Spotify
   search [--play] <query>
                   search Spotify (spotify_player); --play starts the top track
+  login           log in to Spotify (opens your browser), then start the daemon
   daemon          start the spotify_player daemon if it isn't running"""
 
 
@@ -753,15 +853,32 @@ def main():
         open_pane("player")
     elif cmd == "ui":
         curses.wrapper(ui)
+    elif cmd == "login":
+        backend = pick_backend()
+        if not backend.login:
+            sys.exit("The Spotify app backend logs in through the Spotify app itself.")
+        print("Opening your browser to log in to Spotify (one tab per login step)…")
+        if not backend.login(on_url=lambda url: print(f"If no tab opened, visit:\n  {url}")):
+            sys.exit("Login didn't finish.")
+        print("Logged in. spotify_player is running.")
     elif cmd == "daemon":
-        pick_backend().start()
+        backend = pick_backend()
+        if backend.missing_logins():
+            sys.exit("Not logged in to Spotify yet. Run: nowplaying login")
+        backend.start()
     elif cmd == "startup":  # herdr [[startup]] hook: one-shot, opt-in via config
         if CONFIG["autostart_player"]:
-            pick_backend().start()
+            backend = pick_backend()
+            if backend.missing_logins():
+                run([herdr_bin(), "notification", "show", "Now Playing: not logged in to Spotify",
+                     "--body", "Open the player and press a, or run: nowplaying login", "--sound", "none"])
+            else:
+                backend.start()
     elif cmd in ("now", "web"):
         s = pick_backend().status()
         if s["state"] not in ("playing", "paused"):
-            print("nothing playing" if s["state"] == "NO_TRACK" else "player not running")
+            print({"NO_TRACK": "nothing playing",
+                   "NOT_AUTHENTICATED": "not logged in to Spotify. Run: nowplaying login"}.get(s["state"], "player not running"))
         elif cmd == "web":
             open_url(s["url"])
         else:
