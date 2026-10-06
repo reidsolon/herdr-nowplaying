@@ -7,6 +7,13 @@ See and control what's playing on Spotify without leaving [herdr](https://herdr.
 - **Agents panel**: the player pane shows up as an agent, titled with the current track
 - **CLI**: `nowplaying next`, `nowplaying now`, … for scripts and key bindings
 
+<p>
+  <img src="docs/player.png" alt="Now Playing pane: track, artist, album, progress bar, volume, shuffle and repeat, with key hints" width="49%">
+  <img src="docs/search.png" alt="Search results with Tracks, Albums, Artists and Playlists tabs" width="49%">
+</p>
+
+<sub>Track names in the screenshots are fictional demo data.</sub>
+
 > **Not affiliated with Spotify.** This is an unofficial, community plugin. "Spotify" is a trademark
 > of Spotify AB, used here only to describe compatibility.
 
@@ -28,6 +35,8 @@ The plugin picks `spotify_player` if it is installed, otherwise the Spotify app.
 
 ```sh
 herdr plugin install reidsolon/herdr-nowplaying
+# or pin a release
+herdr plugin install reidsolon/herdr-nowplaying --ref v0.2.0
 ```
 
 Optional: put the `nowplaying` command on your PATH.
@@ -111,11 +120,15 @@ Without the symlink, every command is also a plugin action:
 | `←` / `→` | seek ∓10s | `w` | open track in Spotify |
 | `+` / `-` | volume | `t` | play on the spotify_player device |
 | `o` | start the player/app | `q` | close the pane (music keeps playing) |
-| `/` | search | | |
+| `/` | search | `a` | log in (shown when you're logged out) |
 
 In search results: `↑`/`↓` (or `j`/`k`) select, `Tab`/`←`/`→` switch category, `Enter` plays the
 track, album, artist or playlist, `/` searches again, `Esc` goes back. Search needs the
 `spotify_player` backend; with the Spotify app backend, `/` opens the app's own search.
+
+The pane never waits on Spotify: play/pause and volume update instantly, a picked result shows as
+"starting…" right away, and the plugin confirms Spotify actually switched (retrying once if it
+didn't) before showing it as playing.
 
 ### Key bindings
 
@@ -173,7 +186,7 @@ This plugin collects nothing and makes no network requests of its own.
 ## Troubleshooting
 
 - **Controls lag or do nothing, the pane says "rate-limited (429)"**: you're on the shared default
-  client ID. Set your own `client_id` (Option B, steps 2–3) and run `spotify_player authenticate` again.
+  client ID. Set your own `client_id` (Option B, steps 2–3), then press `a` in the player or run `nowplaying login`.
 - **Paused at 0:00 after a while**: `spotify_player` lost its connection to Spotify and reconnected
   paused. Run `nowplaying play`.
 - **"player not running"**: `nowplaying daemon` (Option B), or open the Spotify app (Option A).
@@ -181,6 +194,16 @@ This plugin collects nothing and makes no network requests of its own.
   shows `INVALID_CLIENT: Invalid redirect URI`, add exactly `http://127.0.0.1:8989/login` to your
   app's Redirect URIs in the Spotify dashboard.
 - **Logs**: `~/.cache/spotify-player/*.log`, `herdr plugin log list`.
+
+## Development
+
+```sh
+git clone https://github.com/reidsolon/herdr-nowplaying && cd herdr-nowplaying
+herdr plugin link .     # herdr runs your working copy; reopen the pane to pick up changes
+```
+
+Screenshots are rendered from the real UI with fictional data:
+`pip install pyte pillow fonttools && python docs/render_screenshots.py . docs`.
 
 ## License
 
