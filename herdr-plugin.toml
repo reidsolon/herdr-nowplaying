@@ -1,0 +1,60 @@
+id = "reidsolon.nowplaying"
+name = "Now Playing for Spotify"
+version = "0.1.0"
+min_herdr_version = "0.7.5"
+description = "Show and control what's playing on Spotify from herdr: player pane, agents panel and sidebar line"
+platforms = ["macos"]
+
+# One-shot: starts the spotify_player daemon and/or the sidebar updater only if enabled in config.toml.
+[[startup]]
+command = ["python3", "nowplaying.py", "startup"]
+
+[[panes]]
+id = "player"
+title = "Now Playing"
+placement = "popup"
+width = "60%"
+height = 16
+command = ["python3", "nowplaying.py", "ui"]
+
+[[panes]]
+id = "player-split"
+title = "Now Playing"
+placement = "split"
+command = ["python3", "nowplaying.py", "ui"]
+
+[[actions]]
+id = "open"
+title = "Now Playing: open player"
+contexts = ["workspace"]
+command = ["python3", "nowplaying.py", "open"]
+
+[[actions]]
+id = "open-popup"
+title = "Now Playing: open player popup"
+contexts = ["workspace"]
+command = ["python3", "nowplaying.py", "popup"]
+
+[[actions]]
+id = "play-pause"
+title = "Now Playing: play/pause"
+contexts = ["workspace"]
+command = ["python3", "nowplaying.py", "playpause"]
+
+[[actions]]
+id = "next"
+title = "Now Playing: next track"
+contexts = ["workspace"]
+command = ["python3", "nowplaying.py", "next"]
+
+[[actions]]
+id = "previous"
+title = "Now Playing: previous track"
+contexts = ["workspace"]
+command = ["python3", "nowplaying.py", "previous"]
+
+[[actions]]
+id = "play-here"
+title = "Now Playing: move playback to the spotify_player device"
+contexts = ["workspace"]
+command = ["python3", "nowplaying.py", "transfer"]

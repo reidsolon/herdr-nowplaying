@@ -1,0 +1,15 @@
+# Copy to the plugin config dir (print it with: herdr plugin config-dir reidsolon.nowplaying)
+# as config.toml.
+
+# auto = spotify_player if installed, otherwise the Spotify desktop app (AppleScript)
+backend = "auto"
+
+# Path to spotify_player if it isn't on PATH or in ~/.cargo/bin
+spotify_player_bin = ""
+
+# Start these when the herdr server starts (both off by default)
+autostart_player = false
+autostart_sidebar = false
+
+# Max characters for the sidebar line
+sidebar_width = 30
