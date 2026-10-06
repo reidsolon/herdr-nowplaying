@@ -7,9 +7,5 @@ backend = "auto"
 # Path to spotify_player if it isn't on PATH or in ~/.cargo/bin
 spotify_player_bin = ""
 
-# Start these when the herdr server starts (both off by default)
+# Start the spotify_player daemon when the herdr server starts
 autostart_player = false
-autostart_sidebar = false
-
-# Max characters for the sidebar line
-sidebar_width = 30

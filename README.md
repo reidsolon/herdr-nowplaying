@@ -4,7 +4,6 @@ See and control what's playing on Spotify without leaving [herdr](https://herdr.
 
 - **Player pane**: track, artist, album, progress, volume, shuffle/repeat, with keyboard controls
 - **Agents panel**: the player pane shows up as an agent, titled with the current track
-- **Sidebar line**: `▶ Song — Artist` under the workspace you're in, with no pane open
 - **CLI**: `nowplaying next`, `nowplaying now`, … for scripts and key bindings
 
 > **Not affiliated with Spotify.** This is an unofficial, community plugin. "Spotify" is a trademark
@@ -90,7 +89,6 @@ nowplaying popup      open the player as a popup
 nowplaying play       play/pause            nowplaying next | prev   skip
 nowplaying now        print what's playing  nowplaying web           open track in Spotify
 nowplaying here       move playback to the spotify_player device
-nowplaying sidebar    start the sidebar line (nowplaying sidebar stop to hide)
 nowplaying daemon     start the spotify_player daemon
 ```
 
@@ -106,18 +104,6 @@ Without the symlink, every command is also a plugin action:
 | `←` / `→` | seek ∓10s | `w` | open track in Spotify |
 | `+` / `-` | volume | `t` | play on the spotify_player device |
 | `o` | start the player/app | `q` | close the pane (music keeps playing) |
-
-### Sidebar line
-
-Add a row that renders the plugin's `$nowplaying` token to `~/.config/herdr/config.toml`, then
-`herdr server reload-config` and `nowplaying sidebar`:
-
-```toml
-[ui.sidebar.spaces]
-rows = [["state_icon", "workspace"], ["branch", "git_status"], ["$nowplaying"]]
-```
-
-The line follows the focused workspace and refreshes every ~10s (immediately after a control).
 
 ### Key bindings
 
@@ -145,15 +131,12 @@ Copy [`config.example.toml`](config.example.toml) to the plugin config directory
 | `backend` | `"auto"` | `auto`, `spotify_player` or `applescript` |
 | `spotify_player_bin` | `""` | path if not on PATH or in `~/.cargo/bin` |
 | `autostart_player` | `false` | start the spotify_player daemon when the herdr server starts |
-| `autostart_sidebar` | `false` | start the sidebar line when the herdr server starts |
-| `sidebar_width` | `30` | max characters for the sidebar line |
 
 ## Privacy
 
 This plugin collects nothing and makes no network requests of its own.
 
 - It reads playback state from the Spotify app (AppleScript) or the local `spotify_player` CLI.
-- It writes a pid file and a refresh marker to herdr's plugin state directory.
 - It reads `spotify_player`'s local log only to detect rate-limit errors.
 - Spotify login and tokens are handled entirely by `spotify_player` and stored in
   `~/.cache/spotify-player/`. To disconnect: delete that folder and remove the app under

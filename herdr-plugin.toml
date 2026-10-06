@@ -2,10 +2,10 @@ id = "reidsolon.nowplaying"
 name = "Now Playing for Spotify"
 version = "0.1.0"
 min_herdr_version = "0.7.5"
-description = "Show and control what's playing on Spotify from herdr: player pane, agents panel and sidebar line"
+description = "Show and control what's playing on Spotify from herdr: player pane and agents panel"
 platforms = ["macos"]
 
-# One-shot: starts the spotify_player daemon and/or the sidebar updater only if enabled in config.toml.
+# One-shot: starts the spotify_player daemon only if autostart_player is enabled in config.toml.
 [[startup]]
 command = ["python3", "nowplaying.py", "startup"]
 

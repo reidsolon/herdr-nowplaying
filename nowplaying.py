@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Now Playing for Spotify — a herdr plugin.
 
-Shows what Spotify is playing in a herdr pane, the agents panel and the sidebar, and controls playback.
+Shows what Spotify is playing in a herdr pane and the agents panel, and controls playback.
 
 Backends:
   spotify_player  the `spotify_player -d` daemon (https://github.com/aome510/spotify-player), driven via its CLI
@@ -15,22 +15,18 @@ import json
 import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import time
 
 PLUGIN_ID = os.environ.get("HERDR_PLUGIN_ID", "reidsolon.nowplaying")
 CONFIG_DIR = os.environ.get("HERDR_PLUGIN_CONFIG_DIR") or os.path.expanduser(f"~/.config/herdr/plugins/config/{PLUGIN_ID}")
-STATE_DIR = os.environ.get("HERDR_PLUGIN_STATE_DIR") or os.path.expanduser(f"~/.local/state/herdr/plugins/{PLUGIN_ID}")
 SEP = "\x1f"
 
 DEFAULTS = {
     "backend": "auto",            # auto | spotify_player | applescript
     "spotify_player_bin": "",     # empty = find on PATH or ~/.cargo/bin
     "autostart_player": False,    # start the spotify_player daemon when the herdr server starts
-    "autostart_sidebar": False,   # start the sidebar now-playing line when the herdr server starts
-    "sidebar_width": 30,
 }
 
 
@@ -391,105 +387,12 @@ def loop(stdscr, backend, reporter):
                 amount += s.get("volume", 0)  # absolute target, clamped by the backend
             sent = time.time()
             backend.command(action, amount)
-            request_sidebar_refresh()
             time.sleep(0.3)
             if getattr(backend, "rate_limited_since", lambda _: False)(sent):
                 notice, notice_until = "Spotify rate-limited that request (429). Try again shortly.", now + 4
             fetched, fetched_at = backend.status(), time.monotonic()
             # Spotify often still reports the old track right after a change; check again in ~1s.
             fetched_at -= max(0, backend.poll_seconds - 1)
-
-
-# --- sidebar ---------------------------------------------------------------------------------
-
-SIDEBAR_PID = os.path.join(STATE_DIR, "sidebar.pid")
-REFRESH_FLAG = os.path.join(STATE_DIR, "refresh")
-SIDEBAR_TOKEN = "nowplaying"
-
-
-def request_sidebar_refresh():
-    os.makedirs(STATE_DIR, exist_ok=True)
-    with open(REFRESH_FLAG, "w"):
-        pass
-
-
-def sidebar_pid():
-    try:
-        pid = int(open(SIDEBAR_PID).read())
-        os.kill(pid, 0)
-        return pid
-    except (OSError, ValueError):
-        return None
-
-
-def sidebar_start():
-    if sidebar_pid():
-        return
-    os.makedirs(STATE_DIR, exist_ok=True)
-    subprocess.Popen([sys.executable, os.path.abspath(__file__), "sidebar-run"], start_new_session=True,
-                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-
-def sidebar_stop():
-    pid = sidebar_pid()
-    if pid:
-        os.kill(pid, signal.SIGTERM)
-
-
-def sidebar_text(s):
-    if s["state"] not in ("playing", "paused"):
-        return ""
-    width = int(CONFIG["sidebar_width"])
-    text = f"{state_icon(s)} {s['name']} — {s['artist']}"
-    return text if len(text) <= width else text[:width - 1] + "…"
-
-
-def sidebar_run():
-    """Shows the current track as a $nowplaying token on the focused herdr workspace.
-    Runs detached; exits when herdr goes away."""
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-    with open(SIDEBAR_PID, "w") as f:
-        f.write(str(os.getpid()))
-    herdr = herdr_bin()
-    backend = pick_backend()
-    ttl_ms = 30000
-
-    def report(ws, text):
-        args = ["--token", f"{SIDEBAR_TOKEN}={text}", "--ttl-ms", str(ttl_ms)] if text else ["--clear-token", SIDEBAR_TOKEN]
-        run([herdr, "workspace", "report-metadata", ws, "--source", PLUGIN_ID, *args])
-
-    shown_ws, shown_text, shown_at = None, None, 0
-    status_at, text, failures = 0, "", 0
-    try:
-        while failures < 5:
-            now = time.monotonic()
-            try:
-                workspaces = json.loads(run([herdr, "workspace", "list"]))["result"]["workspaces"]
-                failures = 0
-            except (json.JSONDecodeError, KeyError, TypeError):
-                failures += 1
-                time.sleep(2)
-                continue
-            focused = next((w["workspace_id"] for w in workspaces if w.get("focused")), None)
-
-            flagged = os.path.exists(REFRESH_FLAG)
-            if flagged:
-                os.remove(REFRESH_FLAG)
-                time.sleep(0.5)  # give Spotify a moment to register the change
-            if flagged or now - status_at >= backend.poll_seconds * 2:
-                text, status_at = sidebar_text(backend.status()), now
-
-            if focused != shown_ws and shown_ws:
-                report(shown_ws, "")
-            if focused and (focused != shown_ws or text != shown_text or now - shown_at > ttl_ms / 2000):
-                report(focused, text)
-                shown_ws, shown_text, shown_at = focused, text, now
-            time.sleep(1)
-    finally:
-        if shown_ws:
-            report(shown_ws, "")
-        if sidebar_pid() == os.getpid():
-            os.remove(SIDEBAR_PID)
 
 
 # --- CLI ---------------------------------------------------------------------------------------
@@ -503,7 +406,6 @@ USAGE = """usage: nowplaying [command]
   here            move playback to the spotify_player device
   now             print what's playing
   web             open the current track in Spotify
-  sidebar [stop]  show/hide the current track in the herdr sidebar
   daemon          start the spotify_player daemon if it isn't running"""
 
 
@@ -551,12 +453,6 @@ def main():
     elif cmd == "startup":  # herdr [[startup]] hook: one-shot, opt-in via config
         if CONFIG["autostart_player"]:
             pick_backend().start()
-        if CONFIG["autostart_sidebar"]:
-            sidebar_start()
-    elif cmd == "sidebar":
-        sidebar_stop() if sys.argv[2:3] == ["stop"] else sidebar_start()
-    elif cmd == "sidebar-run":
-        sidebar_run()
     elif cmd in ("now", "web"):
         s = pick_backend().status()
         if s["state"] not in ("playing", "paused"):
@@ -567,7 +463,6 @@ def main():
             print(f"{state_icon(s)} {s['name']} — {s['artist']}  [{fmt(s['position'])}/{fmt(s['duration'])}] on {s['device']}")
     elif cmd in ("playpause", "next", "previous", "transfer"):
         pick_backend().command(cmd)
-        request_sidebar_refresh()
     else:
         sys.exit(f"unknown command: {cmd}\n\n{USAGE}")
 
