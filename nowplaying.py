@@ -16,6 +16,7 @@ import os
 import queue
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -97,13 +98,63 @@ class SpotifyPlayerBackend:
         self.device_name = (sp_config.get("device") or {}).get("name", "spotify-player")
         self.client_id = sp_config.get("client_id") or NCSPOT_CLIENT_ID
         self.cache_dir = os.path.expanduser("~/.cache/spotify-player")
+        self.client_port = int(sp_config.get("client_port") or 8080)
         self.login_proc = None
+        self.heal_lock = threading.Lock()
+        self.last_restart = 0.0
+        self.healed = False  # set when a stuck daemon was restarted; the UI reports it once
 
     def cli(self, *args):
+        # If the daemon isn't reachable, the spotify_player CLI quietly starts a throwaway client to
+        # answer instead, so commands "succeed" without touching the real player. Never let that happen.
+        if not self.ensure_ready():
+            return ""
         return run([self.bin, *args])
 
     def daemon_running(self):
         return subprocess.run(["pgrep", "-f", "spotify_player -d"], capture_output=True).returncode == 0
+
+    def control_reachable(self):
+        """True if something is listening on the daemon's control port (UDP client_port). Binding it
+        ourselves succeeds only when nothing is."""
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.bind(("127.0.0.1", self.client_port))
+            return False
+        except OSError:
+            return True
+        finally:
+            probe.close()
+
+    def ensure_ready(self, start_if_stopped=True):
+        """Make sure the daemon is running and listening. Restarts a daemon that is still connected to
+        Spotify but no longer accepts commands (seen after long uptimes with many reconnects)."""
+        if self.control_reachable():
+            return True
+        if self.missing_logins():
+            return False
+        with self.heal_lock:
+            if self.control_reachable():
+                return True
+            running = self.daemon_running()
+            if not running and not start_if_stopped:
+                return False
+            if time.monotonic() - self.last_restart < 30:
+                return False  # just tried; don't loop restarting
+            self.last_restart = time.monotonic()
+            if running:
+                subprocess.run(["pkill", "-f", "spotify_player -d"], capture_output=True)
+                for _ in range(20):
+                    if not self.daemon_running():
+                        break
+                    time.sleep(0.1)
+                self.healed = True
+            subprocess.run([self.bin, "-d"], capture_output=True)
+            for _ in range(40):
+                if self.control_reachable():
+                    return True
+                time.sleep(0.125)
+            return False
 
     def missing_logins(self):
         """spotify_player keeps two logins: librespot credentials for streaming and a Web API token
@@ -137,14 +188,15 @@ class SpotifyPlayerBackend:
             self.login_proc.terminate()
 
     def start(self):
-        if not self.daemon_running() and not self.missing_logins():
-            subprocess.run([self.bin, "-d"], capture_output=True)
+        self.last_restart = 0.0
+        self.ensure_ready()
 
     def status(self):
         missing = self.missing_logins()
         if missing:
             return {"state": "NOT_AUTHENTICATED", "missing": missing}
-        if not self.daemon_running():
+        # Polling never starts a stopped daemon, but it does heal a running one that went deaf.
+        if not self.ensure_ready(start_if_stopped=False):
             return {"state": "NOT_RUNNING"}
         try:
             d = json.loads(self.cli("get", "key", "playback") or "null")
@@ -605,6 +657,9 @@ class Session:
     def _poll(self):
         while True:
             self._store(self.backend.status())
+            if getattr(self.backend, "healed", False):
+                self.backend.healed = False
+                self.say("spotify_player had stopped responding; restarted it.", 6)
             self.wake.wait(self.backend.poll_seconds)
             self.wake.clear()
 

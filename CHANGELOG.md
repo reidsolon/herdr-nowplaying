@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.1 — 2026-10-07
+
+### Fixed
+- Playback could silently stop working after `spotify_player` had been running for a long time: the
+  daemon stayed connected to Spotify (and listed as a device) but stopped listening on its control
+  port, so every command went to a throwaway client instead. The plugin now checks the control port
+  before each command, restarts a daemon that has gone deaf (and says so), starts a stopped daemon
+  when you press a key, and never lets a command fall through to a throwaway client.
+
 ## 0.2.0 — 2026-10-07
 
 ### Added
