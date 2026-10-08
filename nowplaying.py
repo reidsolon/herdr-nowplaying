@@ -10,6 +10,7 @@ Backends:
 Python 3.9+ standard library only.
 """
 import curses
+import datetime
 import glob
 import json
 import os
@@ -102,6 +103,7 @@ class SpotifyPlayerBackend:
         self.login_proc = None
         self.heal_lock = threading.Lock()
         self.last_restart = 0.0
+        self.last_reconnect = 0.0
         self.healed = False  # set when a stuck daemon was restarted; the UI reports it once
 
     def cli(self, *args):
@@ -222,14 +224,58 @@ class SpotifyPlayerBackend:
             "context": (d.get("context") or {}).get("uri", ""),
         }
 
-    def rate_limited_since(self, since):
-        """The CLI exits 0 even when Spotify rejects a request, so check the daemon log for 429s."""
-        logs = sorted(glob.glob(os.path.expanduser("~/.cache/spotify-player/*.log")), key=os.path.getmtime)
+    def request_errors_since(self, since):
+        """HTTP statuses of requests the daemon reported failing after `since` (epoch seconds). The CLI
+        exits 0 even when Spotify rejects a request, so the daemon's log is the only signal. Includes the
+        custom client's own failure (e.g. 404), not just the ncspot fallback's (often 429)."""
+        logs = sorted(glob.glob(os.path.join(self.cache_dir, "*.log")), key=os.path.getmtime)
         if not logs or os.path.getmtime(logs[-1]) < since:
-            return False
+            return set()
         with open(logs[-1], "rb") as f:
-            f.seek(max(0, os.path.getsize(logs[-1]) - 4000))
-            return any(b"429 Too Many Requests" in line for line in f.read().splitlines()[-2:])
+            f.seek(max(0, os.path.getsize(logs[-1]) - 16000))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+        errors = set()
+        for line in lines:
+            if "Failed to handle a player request" not in line and "Web API request failed" not in line:
+                continue
+            try:
+                when = datetime.datetime.strptime(line[:26], "%Y-%m-%dT%H:%M:%S.%f").replace(
+                    tzinfo=datetime.timezone.utc).timestamp()
+            except ValueError:
+                continue
+            m = re.search(r"status(?: code)?[= ](\d{3})", line)
+            if when >= since and m:
+                errors.add(int(m.group(1)))
+        return errors
+
+    def rate_limited_since(self, since):
+        return 429 in self.request_errors_since(since)
+
+    def restart(self):
+        """Restart the daemon so it registers a fresh Spotify Connect device. Needed when Spotify has lost
+        the device (its dealer connection died after sleep/network changes) while the daemon still runs
+        and accepts commands: every request then 404s. Returns True once Spotify lists the device again."""
+        if time.monotonic() - self.last_reconnect < 60:
+            return False  # one reconnect per minute at most
+        self.last_reconnect = time.monotonic()
+        with self.heal_lock:
+            subprocess.run(["pkill", "-f", "spotify_player -d"], capture_output=True)
+            for _ in range(20):
+                if not self.daemon_running():
+                    break
+                time.sleep(0.1)
+            self.last_restart = 0.0
+        if not self.ensure_ready():
+            return False
+        for _ in range(16):
+            try:
+                devices = json.loads(run([self.bin, "get", "key", "devices"]) or "[]")
+            except json.JSONDecodeError:
+                devices = []
+            if any(d.get("name") == self.device_name for d in devices or []):
+                return True
+            time.sleep(0.5)
+        return False
 
     def search(self, query):
         """Returns {category: [{"kind", "id", "title", "sub"}]} for tracks, albums, artists and playlists,
@@ -696,10 +742,9 @@ class Session:
         def job():
             sent = time.time()
             self.backend.command(action, amount)
-            time.sleep(0.3)
-            if getattr(self.backend, "rate_limited_since", lambda _: False)(sent):
-                self.say("Spotify rate-limited that request (429). Try again shortly.")
-            self.refresh()
+            self.refresh(0.3)
+            # Check the outcome off the queue so rapid key presses don't wait on it.
+            threading.Thread(target=self._after_command, args=(action, amount, sent), daemon=True).start()
             self.refresh(1.5)  # Spotify often still reports the old track right after a change
         self.jobs.put(job)
 
@@ -716,14 +761,42 @@ class Session:
             return s.get("id") == item["id"]
         return item["id"] in s.get("context", "") or (s.get("state") == "playing" and s.get("id") not in ("", prev_id))
 
+    def _after_command(self, action, amount, sent):
+        time.sleep(0.6)  # the daemon logs a failed request a few hundred ms after the CLI returns
+        errors = self._errors_since(sent)
+        if 404 in errors and self._reconnect():
+            self.jobs.put(lambda: (self.backend.command(action, amount), self.refresh(0.3)))
+        elif 429 in errors:
+            self.say("Spotify rate-limited that request (429). Try again shortly.")
+
+    def _errors_since(self, since):
+        return getattr(self.backend, "request_errors_since", lambda _: set())(since)
+
+    def _reconnect(self):
+        """Spotify answered 404: it lost our Connect device. Restart the daemon to register it again."""
+        restart = getattr(self.backend, "restart", None)
+        if not restart:
+            return False
+        self.say("Spotify lost the player device; reconnecting…", 10)
+        if restart():
+            self.say("Reconnected the player device to Spotify.", 5)
+            return True
+        self.say("Couldn't reconnect the player device. Try again in a minute.", 8)
+        return False
+
     def _play_confirmed(self, item, prev_id, pending):
         current = lambda: self.pending is pending
-        for _attempt in range(2):
+        for attempt in range(2):
             if not current():
                 return
+            sent = time.time()
             self.backend.play_item(item)
-            for _check in range(2):
-                time.sleep(1.5)
+            time.sleep(1.0)
+            if 404 in self._errors_since(sent) and attempt == 0 and self._reconnect():
+                continue  # retry the play on the freshly registered device
+            for check in range(2):
+                if check:
+                    time.sleep(1.0)
                 s = self.backend.status()
                 with self.lock:
                     if self.pending is not pending:
@@ -869,6 +942,22 @@ USAGE = """usage: nowplaying [command]
   daemon          start the spotify_player daemon if it isn't running"""
 
 
+def run_with_recovery(backend, do):
+    """CLI/action path: run a command, and if Spotify answered 404 (it lost our Connect device),
+    reconnect the device and run it once more."""
+    sent = time.time()
+    do()
+    if not getattr(backend, "restart", None):
+        return
+    time.sleep(0.6)  # the daemon logs a failed request shortly after the CLI returns
+    if 404 in backend.request_errors_since(sent):
+        print("Spotify lost the player device; reconnecting…", file=sys.stderr)
+        if backend.restart():
+            do()
+        else:
+            sys.exit("Couldn't reconnect the player device. Try again in a minute.")
+
+
 def open_pane(entrypoint):
     if not os.environ.get("HERDR_ENV"):
         curses.wrapper(ui)
@@ -955,7 +1044,7 @@ def main():
         if play:
             if not tracks:
                 sys.exit("no tracks found")
-            backend.play_item(tracks[0])
+            run_with_recovery(backend, lambda: backend.play_item(tracks[0]))
             print(f"▶ {tracks[0]['title']} — {tracks[0]['sub']}")
             return
         for name in ("Tracks", "Albums", "Artists", "Playlists"):
@@ -965,7 +1054,8 @@ def main():
                 for item in items:
                     print(f"  {item['title']}" + (f"  —  {item['sub']}" if item["sub"] else ""))
     elif cmd in ("playpause", "next", "previous", "transfer"):
-        pick_backend().command(cmd)
+        backend = pick_backend()
+        run_with_recovery(backend, lambda: backend.command(cmd))
     else:
         sys.exit(f"unknown command: {cmd}\n\n{USAGE}")
 

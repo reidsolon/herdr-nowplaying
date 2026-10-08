@@ -36,7 +36,7 @@ The plugin picks `spotify_player` if it is installed, otherwise the Spotify app.
 ```sh
 herdr plugin install reidsolon/herdr-nowplaying
 # or pin a release
-herdr plugin install reidsolon/herdr-nowplaying --ref v0.2.1
+herdr plugin install reidsolon/herdr-nowplaying --ref v0.2.2
 ```
 
 Optional: put the `nowplaying` command on your PATH.
@@ -189,6 +189,10 @@ This plugin collects nothing and makes no network requests of its own.
   client ID. Set your own `client_id` (Option B, steps 2–3), then press `a` in the player or run `nowplaying login`.
 - **Paused at 0:00 after a while**: `spotify_player` lost its connection to Spotify and reconnected
   paused. Run `nowplaying play`.
+- **"Spotify lost the player device; reconnecting…"**: after sleep or a network change,
+  `spotify_player`'s Spotify Connect connection can die while the daemon keeps running, and Spotify
+  answers every request with `404`. The plugin restarts the daemon to register the device again and
+  retries your command once.
 - **"spotify_player had stopped responding; restarted it."**: the daemon was still connected to
   Spotify but had stopped accepting commands (it happens after long uptimes). The plugin restarted
   it; press play again.

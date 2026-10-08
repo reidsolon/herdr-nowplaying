@@ -1,6 +1,6 @@
 id = "reidsolon.nowplaying"
 name = "Now Playing for Spotify"
-version = "0.2.1"
+version = "0.2.2"
 min_herdr_version = "0.7.5"
 description = "Show and control what's playing on Spotify from herdr: player pane and agents panel"
 platforms = ["macos"]

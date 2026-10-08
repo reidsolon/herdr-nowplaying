@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.2 — 2026-10-08
+
+### Fixed
+- Plays and controls failing with `404` after the Mac slept or changed networks. `spotify_player`
+  keeps running and accepting commands, but its Spotify Connect device connection dies and Spotify
+  can no longer reach it. The plugin now reads the daemon log after each command (the CLI reports
+  success either way), and on a `404` restarts the daemon, waits until Spotify lists the device
+  again, and retries once. Works from the pane, the CLI and plugin actions/key bindings.
+- Rate-limit detection now sees the custom client's own failure, not only the ncspot fallback's.
+
 ## 0.2.1 — 2026-10-07
 
 ### Fixed
