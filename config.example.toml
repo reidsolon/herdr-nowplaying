@@ -1,7 +1,8 @@
-# Copy to the plugin config dir (print it with: herdr plugin config-dir reidsolon.nowplaying)
-# as config.toml.
+# Every Now Playing setting. Setup (`nowplaying setup`) writes config.toml in the plugin config dir
+# (print it with: herdr plugin config-dir reidsolon.nowplaying); edit that file to change these.
 
-# auto = spotify_player if installed, otherwise the Spotify desktop app (AppleScript)
+# spotify_player, applescript (the Spotify desktop app), or auto = spotify_player if installed,
+# otherwise the Spotify app
 backend = "auto"
 
 # Path to spotify_player if it isn't on PATH or in ~/.cargo/bin

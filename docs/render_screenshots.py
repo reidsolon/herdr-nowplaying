@@ -1,4 +1,4 @@
-"""Regenerate docs/player.png and docs/search.png from the real UI with fictional demo data.
+"""Regenerate the docs/*.png screenshots from the real UI with fictional demo data.
 
 Dev-only (not used by the plugin):  pip install pyte pillow fonttools
 Usage:  python docs/render_screenshots.py . docs
@@ -9,15 +9,16 @@ from PIL import Image, ImageDraw, ImageFont
 from fontTools.ttLib import TTCollection
 
 REPO, OUT = sys.argv[1], sys.argv[2]
-COLS, ROWS = 66, 16
+SIZES = {"player": (66, 16), "search": (66, 16), "setup": (90, 14)}
 pyte.graphics.TEXT[2] = "+italics"   # pyte ignores SGR 2 (dim); carry it as italics, drawn dim below
 
 SCENES = {
     "player": [],
     "search": ["/", "sleep:0.3", "night drive", "sleep:0.3", "\r", "sleep:1.2"],
+    "setup": ["1", "sleep:0.5"],  # welcome -> "Create your Spotify app"
 }
 
-def child():
+def child(scene):
     os.environ["TERM"] = "xterm-256color"
     for k in ("HERDR_PANE_ID", "HERDR_ENV"): os.environ.pop(k, None)
     sys.path.insert(0, REPO)
@@ -40,12 +41,23 @@ def child():
         def missing_logins(self): return []
         rate_limited_since = lambda self, s: False
     n.pick_backend = lambda: Demo()
-    curses.wrapper(n.ui)
+    # Never touch the real machine: no clipboard, browser, or config writes.
+    n.open_url = lambda url: None
+    n.copy_to_clipboard = lambda text: True
+    n.write_plugin_config = lambda values: None
+    if scene == "setup":
+        n.spotify_player_bin = lambda: "/bin/sh"  # "installed", so setup goes straight to the Client ID step
+        n.current_client_id = lambda: ""
+        curses.wrapper(n.ui, True)
+    else:
+        n.needs_setup = lambda: False
+        curses.wrapper(n.ui)
 
-def capture(keys):
+def capture(scene, keys):
+    COLS, ROWS = SIZES[scene]
     pid, fd = pty.fork()
     if pid == 0:
-        child(); os._exit(0)
+        child(scene); os._exit(0)
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
     screen = pyte.Screen(COLS, ROWS); stream = pyte.ByteStream(screen)
     def pump(t):
@@ -75,11 +87,29 @@ BG, FG = (30, 33, 40), (191, 197, 208)
 COLORS = {"green": (152, 195, 121), "yellow": (229, 192, 123), "default": FG}
 PAD, BAR = 28 * SCALE, 34 * SCALE
 
+def media_icon(d, ch, px, py, fill):
+    """⏮ ⏸ ⏭ aren't in Menlo (only in Apple Color Emoji), so draw them as shapes."""
+    w, h = CW * 0.9, LH * 0.42
+    x0, y0, y1 = px + CW * 0.05, py + (LH - h) / 2, py + (LH + h) / 2
+    bar = max(2, int(w * 0.16))
+    if ch == "⏸":
+        d.rectangle([x0 + w * 0.15, y0, x0 + w * 0.15 + bar, y1], fill=fill)
+        d.rectangle([x0 + w * 0.85 - bar, y0, x0 + w * 0.85, y1], fill=fill)
+        return
+    mid = (y0 + y1) / 2
+    if ch == "⏭":
+        d.polygon([(x0, y0), (x0 + w - bar, mid), (x0, y1)], fill=fill)
+        d.rectangle([x0 + w - bar, y0, x0 + w, y1], fill=fill)
+    else:  # ⏮
+        d.rectangle([x0, y0, x0 + bar, y1], fill=fill)
+        d.polygon([(x0 + w, y0), (x0 + bar, mid), (x0 + w, y1)], fill=fill)
+
 def font_for(ch, bold):
     if bold and ord(ch) in cmaps[1]: return F[1]
     return F[0]
 
 def draw(snap, path, title):
+    COLS = len(snap[0])
     while len(snap) > 1 and not "".join(c.data for c in snap[-1]).strip() and not "".join(c.data for c in snap[-2]).strip():
         snap = snap[:-1]  # crop trailing blank rows, keep one for breathing room
     rows = len(snap)
@@ -106,12 +136,33 @@ def draw(snap, path, title):
             if c.data in "━─":  # draw bar segments as solid lines so they join without seams
                 t = 3 * SCALE if c.data == "━" else 1 * SCALE
                 d.rectangle([px, py + LH / 2 - t / 2, px + CW + 0.5, py + LH / 2 + t / 2], fill=fg)
+            elif c.data in "⏮⏸⏭":
+                media_icon(d, c.data, px, py, fg)
             elif c.data.strip():
                 d.text((px, py + LH / 2), c.data, font=font_for(c.data, c.bold), fill=fg, anchor="lm")
     img.save(path, optimize=True)
 
+def tab_bar_snap(cols=100):
+    """herdr's bottom tab row with `nowplaying bar` output on the right (herdr draws it; we fake the row)."""
+    sys.path.insert(0, REPO)
+    import nowplaying as n
+    n.CONFIG.update({k: n.DEFAULTS[k] for k in n.DEFAULTS if k.startswith("bar_")})
+    text = n.bar_line({"state": "playing", "name": "Midnight Static", "artist": "The Lantern Club",
+                       "position": 102, "duration": 238})
+    Char = pyte.screens.Char
+    row = [Char(" ")] + [Char(c, reverse=True) for c in "  1  "] + [Char(c) for c in "  +"]
+    row += [Char(" ")] * (cols - len(row) - len(text) - 1) + [Char(c, fg="green" if c in "⏮⏸⏭" else "default") for c in text] + [Char(" ")]
+    blank = [Char(" ")] * cols
+    return [blank, row, blank]
+
 for name, keys in SCENES.items():
-    snap = capture(keys)
-    draw(snap, os.path.join(OUT, f"{name}.png"), "herdr · Now Playing")
+    snap = capture(name, keys)
+    title = "herdr · Now Playing setup" if name == "setup" else "herdr · Now Playing"
+    draw(snap, os.path.join(OUT, f"{name}.png"), title)
     print(name, "->", os.path.join(OUT, f"{name}.png"))
     print("\n".join("".join(c.data for c in row).rstrip() for row in snap))
+
+snap = tab_bar_snap()
+draw(snap, os.path.join(OUT, "tabbar.png"), "herdr · tab bar")
+print("tabbar ->", os.path.join(OUT, "tabbar.png"))
+print("\n".join("".join(c.data for c in row).rstrip() for row in snap))
