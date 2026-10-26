@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.4.0 — 2026-10-26
+
+### Added
+- Setup, a step-by-step popup that replaces the README's copy-and-paste steps. It opens with
+  `herdr plugin action invoke reidsolon.nowplaying.setup`, `nowplaying setup`, or the first time you
+  open the player. It picks the player, builds `spotify_player` with cargo if needed, opens the
+  Spotify dashboard and copies the Redirect URI, saves your pasted Client ID to `app.toml`, runs
+  the browser login, and optionally adds herdr key bindings and the tab bar line. Your herdr config
+  is backed up, keys you already use are skipped, and the change is rolled back if
+  `herdr config check` reports a new problem.
+- The `nowplaying` command is now a small launcher that asks herdr for the plugin's current
+  install, so it keeps working after plugin updates. (The old symlink pointed into one install
+  folder.)
+- The herdr startup hook reminds you to finish setup.
+
+### Fixed
+- On Python 3.9 (macOS's built-in `python3`), starting `spotify_player` within 30 seconds of a
+  command starting (`nowplaying daemon`, login, the startup autostart) silently did nothing, and
+  reconnecting a lost device failed in the first minute. `time.monotonic()` starts near zero there,
+  so "never restarted" looked like "just restarted".
+- Arrow keys sent as `ESC [ A/B` are recognised in setup's lists.
+
 ## 0.3.0 — 2026-10-22
 
 ### Added

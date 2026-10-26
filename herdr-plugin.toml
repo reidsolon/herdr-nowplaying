@@ -1,11 +1,11 @@
 id = "reidsolon.nowplaying"
 name = "Now Playing for Spotify"
-version = "0.3.0"
+version = "0.4.0"
 min_herdr_version = "0.7.5"
-description = "Show and control what's playing on Spotify from herdr: player pane and agents panel"
+description = "Show and control what's playing on Spotify from herdr: player pane, agents panel, tab bar, guided setup"
 platforms = ["macos"]
 
-# One-shot: starts the spotify_player daemon only if autostart_player is enabled in config.toml.
+# One-shot: reminds you to finish setup, or starts the spotify_player daemon if autostart_player is on.
 [[startup]]
 command = ["python3", "nowplaying.py", "startup"]
 
@@ -18,10 +18,24 @@ height = 16
 command = ["python3", "nowplaying.py", "ui"]
 
 [[panes]]
+id = "setup"
+title = "Now Playing setup"
+placement = "popup"
+width = "80%"
+height = 24
+command = ["python3", "nowplaying.py", "setup-ui"]
+
+[[panes]]
 id = "player-split"
 title = "Now Playing"
 placement = "split"
 command = ["python3", "nowplaying.py", "ui"]
+
+[[actions]]
+id = "setup"
+title = "Now Playing: set up"
+contexts = ["workspace"]
+command = ["python3", "nowplaying.py", "setup"]
 
 [[actions]]
 id = "open"

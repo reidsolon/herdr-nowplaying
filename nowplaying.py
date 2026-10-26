@@ -16,13 +16,16 @@ import json
 import os
 import queue
 import re
+import shlex
 import shutil
 import socket
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 import urllib.parse
+from collections import deque
 
 PLUGIN_ID = os.environ.get("HERDR_PLUGIN_ID", "reidsolon.nowplaying")
 CONFIG_DIR = os.environ.get("HERDR_PLUGIN_CONFIG_DIR") or os.path.expanduser(f"~/.config/herdr/plugins/config/{PLUGIN_ID}")
@@ -106,8 +109,9 @@ class SpotifyPlayerBackend:
         self.client_port = int(sp_config.get("client_port") or 8080)
         self.login_proc = None
         self.heal_lock = threading.Lock()
-        self.last_restart = 0.0
-        self.last_reconnect = 0.0
+        # None = never. Not 0.0: on Python 3.9 macOS, time.monotonic() starts near 0 with the process.
+        self.last_restart = None
+        self.last_reconnect = None
         self.healed = False  # set when a stuck daemon was restarted; the UI reports it once
 
     def cli(self, *args):
@@ -145,7 +149,7 @@ class SpotifyPlayerBackend:
             running = self.daemon_running()
             if not running and not start_if_stopped:
                 return False
-            if time.monotonic() - self.last_restart < 30:
+            if self.last_restart is not None and time.monotonic() - self.last_restart < 30:
                 return False  # just tried; don't loop restarting
             self.last_restart = time.monotonic()
             if running:
@@ -194,7 +198,7 @@ class SpotifyPlayerBackend:
             self.login_proc.terminate()
 
     def start(self):
-        self.last_restart = 0.0
+        self.last_restart = None
         self.ensure_ready()
 
     def status(self, heal=True):
@@ -266,7 +270,7 @@ class SpotifyPlayerBackend:
         """Restart the daemon so it registers a fresh Spotify Connect device. Needed when Spotify has lost
         the device (its dealer connection died after sleep/network changes) while the daemon still runs
         and accepts commands: every request then 404s. Returns True once Spotify lists the device again."""
-        if time.monotonic() - self.last_reconnect < 60:
+        if self.last_reconnect is not None and time.monotonic() - self.last_reconnect < 60:
             return False  # one reconnect per minute at most
         self.last_reconnect = time.monotonic()
         with self.heal_lock:
@@ -275,7 +279,7 @@ class SpotifyPlayerBackend:
                 if not self.daemon_running():
                     break
                 time.sleep(0.1)
-            self.last_restart = 0.0
+            self.last_restart = None
         if not self.ensure_ready():
             return False
         for _ in range(16):
@@ -407,10 +411,14 @@ class AppleScriptBackend:
             self.tell(script)
 
 
+def spotify_player_bin():
+    return (CONFIG["spotify_player_bin"] or shutil.which("spotify_player")
+            or os.path.expanduser("~/.cargo/bin/spotify_player"))
+
+
 def pick_backend():
     choice = os.environ.get("NOWPLAYING_BACKEND") or CONFIG["backend"]
-    binary = (CONFIG["spotify_player_bin"] or shutil.which("spotify_player")
-              or os.path.expanduser("~/.cargo/bin/spotify_player"))
+    binary = spotify_player_bin()
     if choice != "applescript" and os.access(binary, os.X_OK):
         return SpotifyPlayerBackend(binary)
     if choice == "spotify_player":
@@ -582,11 +590,17 @@ def lone_escape(stdscr, drop_paste=False):
     """Call after reading ESC. Swallows the rest of an escape sequence and returns True only for a
     real Esc key press. Terminals (and herdr) wrap pasted text in ESC[200~ ... ESC[201~; with
     drop_paste the pasted text is discarded too, so it can't trigger single-key shortcuts."""
+    return escape_sequence(stdscr, drop_paste) is None
+
+
+def escape_sequence(stdscr, drop_paste=False):
+    """Like lone_escape, but returns what followed ESC[ or ESC O (for example "B" for the down
+    arrow, which curses doesn't always translate), or None for a real Esc key press."""
     stdscr.nodelay(True)
     try:
         first = stdscr.getch()
         if first == -1:
-            return True
+            return None
         seq = ""
         if first in (ord("["), ord("O")):
             while True:  # CSI/SS3: parameters until a final byte (letter or ~)
@@ -602,7 +616,7 @@ def lone_escape(stdscr, drop_paste=False):
                 ch = stdscr.getch()
                 if ch != -1:
                     tail = (tail + chr(ch))[-6:]
-        return False
+        return seq
     finally:
         stdscr.timeout(500)
 
@@ -899,12 +913,16 @@ class Session:
         return s, notice
 
 
-def ui(stdscr):
+def ui(stdscr, setup=False):
     curses.set_escdelay(25)
     curses.curs_set(0)
     curses.use_default_colors()
     curses.init_pair(1, curses.COLOR_GREEN, -1)
     curses.init_pair(2, curses.COLOR_YELLOW, -1)
+    if setup or needs_setup():
+        stdscr.timeout(500)
+        if not Setup(stdscr).run():
+            return
     stdscr.timeout(250)
 
     reporter = AgentReporter()
@@ -960,6 +978,557 @@ def loop(stdscr, backend, reporter):
             session.command(action, amount)
 
 
+# --- setup -------------------------------------------------------------------------------------
+# Everything a new user would otherwise copy and paste from the README: building spotify_player,
+# registering a Spotify client ID, logging in, the `nowplaying` command and herdr key bindings.
+
+DASHBOARD_URL = "https://developer.spotify.com/dashboard"
+REDIRECT_URI = "http://127.0.0.1:8989/login"  # spotify_player's default login_redirect_uri
+RUSTUP_URL = "https://rustup.rs"
+CARGO_INSTALL = ["install", "spotify_player", "--locked", "--no-default-features", "--features", "daemon,rodio-backend"]
+LAUNCHER_MARK = "nowplaying launcher"
+BAR_COMMAND = "~/.local/bin/nowplaying bar"
+
+KEYBINDINGS = {  # (key, action, description)
+    "player": [("prefix+m", "open-popup", "now playing")],
+    "controls": [("prefix+comma", "previous", "previous track"),
+                 ("prefix+space", "play-pause", "play / pause"),
+                 ("prefix+period", "next", "next track")],
+}
+BAR_KEYS = {"previous": "bar_key_previous", "play-pause": "bar_key_play_pause", "next": "bar_key_next"}
+
+
+def home(*parts):
+    return os.path.join(os.path.expanduser("~"), *parts)
+
+
+def plugin_config_path():
+    return os.path.join(CONFIG_DIR, "config.toml")
+
+
+def spotify_player_config_path():
+    return home(".config", "spotify-player", "app.toml")
+
+
+def herdr_config_path():
+    return home(".config", "herdr", "config.toml")
+
+
+def needs_setup():
+    """Setup writes the plugin's config.toml, so a missing one means a fresh install."""
+    return not os.path.exists(plugin_config_path())
+
+
+def read_text(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return ""
+
+
+def write_text(path, text, mode=0o644):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp-{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def toml_literal(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    return json.dumps(value)
+
+
+def set_toml_keys(text, values, overwrite=True):
+    """Set top-level keys in TOML text, leaving comments, other keys and sections as they are."""
+    lines = text.splitlines()
+    end = next((i for i, line in enumerate(lines) if line.lstrip().startswith("[")), len(lines))
+    for key, value in values.items():
+        line = f"{key} = {toml_literal(value)}"
+        found = next((i for i in range(end) if re.match(rf"\s*{re.escape(key)}\s*=", lines[i])), None)
+        if found is None:
+            at = end
+            while at > 0 and not lines[at - 1].strip():
+                at -= 1
+            lines.insert(at, line)
+            end += 1
+        elif overwrite:
+            lines[found] = line
+    return "\n".join(lines) + "\n"
+
+
+def spotify_player_config(text, client_id):
+    text = set_toml_keys(text, {"client_id": client_id,
+                                "enable_media_control": False})  # the daemon can't run with it on macOS
+    text = set_toml_keys(text, {"client_port": 18080,  # the default 8080 often clashes with dev servers
+                                "enable_notify": False}, overwrite=False)
+    if not re.search(r"(?m)^\s*\[device\]", text):
+        text = text.rstrip("\n") + '\n\n[device]\nname = "herdr"\ndevice_type = "computer"\n'
+    return text
+
+
+def current_client_id():
+    return parse_toml(spotify_player_config_path()).get("client_id", "")
+
+
+def write_plugin_config(values):
+    path = plugin_config_path()
+    text = read_text(path) or ("# Now Playing for Spotify, written by setup. Every setting is described in\n"
+                               "# config.example.toml in the plugin folder.\n")
+    write_text(path, set_toml_keys(text, values))
+    CONFIG.update(values)
+
+
+def add_keybindings(text, bindings):
+    """Append herdr [[keys.command]] blocks for plugin actions. Returns (text, actions bound, keys
+    skipped because the user already uses them for something else)."""
+    bound, skipped = set(), []
+    for key, action, description in bindings:
+        command = f"{PLUGIN_ID}.{action}"
+        if re.search(rf'(?m)^\s*command\s*=\s*"{re.escape(command)}"', text):
+            bound.add(action)
+            continue
+        if re.search(rf'(?m)^\s*key\s*=\s*"{re.escape(key)}"', text):
+            skipped.append(key)
+            continue
+        block = f'[[keys.command]]\nkey = "{key}"\ntype = "plugin_action"\ncommand = "{command}"\ndescription = "{description}"\n'
+        text = (text.rstrip("\n") + "\n\n" if text.strip() else "") + block
+        bound.add(action)
+    return text, bound, skipped
+
+
+def add_tab_bar(text, command, bottom=False):
+    """Add a `nowplaying bar` command entry to herdr's [ui] tab_bar_right. Returns the new text, or
+    None when an existing tab_bar_right is laid out in a way this can't edit safely."""
+    entry = f'{{ type = "command", command = "{command}", interval_seconds = 5, timeout_seconds = 4 }}'
+    lines = text.splitlines()
+    start = next((i for i, line in enumerate(lines) if re.fullmatch(r"\s*\[ui\]\s*(#.*)?", line)), None)
+    if start is None:
+        lines += ([""] if lines and lines[-1].strip() else []) + ["[ui]"]
+        start = len(lines) - 1
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].lstrip().startswith("[")), len(lines))
+    section = lines[start + 1:end]
+
+    def find(key):
+        return next((i for i, line in enumerate(section) if re.match(rf"\s*{key}\s*=", line)), None)
+
+    if "nowplaying bar" not in text:
+        i = find("tab_bar_right")
+        if i is None:
+            section[0:0] = ["tab_bar_right = [", f"  {entry},", "]"]
+        elif re.fullmatch(r"\s*tab_bar_right\s*=\s*\[\s*", section[i]):
+            section.insert(i + 1, f"  {entry},")
+        elif m := re.fullmatch(r"(\s*tab_bar_right\s*=\s*\[)(.*)\]\s*", section[i]):
+            inner = m.group(2).strip().rstrip(",")
+            section[i] = f"{m.group(1)}{inner + ', ' if inner else ''}{entry}]"
+        else:
+            return None
+    if find("hide_tab_bar_when_single_tab") is None:
+        section.insert(0, "hide_tab_bar_when_single_tab = false")
+    if bottom:
+        i = find("tab_bar_position")
+        if i is None:
+            section.insert(0, 'tab_bar_position = "bottom"')
+        else:
+            section[i] = 'tab_bar_position = "bottom"'
+    lines[start + 1:end] = section
+    return "\n".join(lines) + "\n"
+
+
+def launcher_script(herdr):
+    return f"""#!/bin/sh
+# {LAUNCHER_MARK} for the herdr plugin {PLUGIN_ID}, written by its setup.
+# Finds the plugin's current install on every run, so plugin updates never leave it stale.
+herdr="${{HERDR_BIN_PATH:-$(command -v herdr || echo {shlex.quote(herdr)})}}"
+root=$("$herdr" plugin list --json 2>/dev/null | /usr/bin/env python3 -c '
+import json, sys
+for p in json.load(sys.stdin)["result"]["plugins"]:
+    if p.get("plugin_id") == "{PLUGIN_ID}" and p.get("enabled", True):
+        print(p["plugin_root"])
+' 2>/dev/null)
+if [ -z "$root" ]; then
+    echo "nowplaying: the herdr plugin {PLUGIN_ID} isn't installed or enabled" >&2
+    exit 1
+fi
+exec python3 "$root/nowplaying.py" "$@"
+"""
+
+
+def install_launcher():
+    """Install the `nowplaying` command in ~/.local/bin. Returns (ok, note)."""
+    path = home(".local", "bin", "nowplaying")
+    if os.path.lexists(path):
+        ours = os.path.islink(path) and os.readlink(path).endswith(os.path.join("bin", "nowplaying"))
+        if not ours:
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    ours = LAUNCHER_MARK in f.read(4000)
+            except OSError:
+                pass
+        if not ours:
+            return False, f"{path} already exists and isn't from this plugin, so setup left it alone."
+        os.remove(path)
+    herdr = herdr_bin()
+    write_text(path, launcher_script(os.path.abspath(shutil.which(herdr) or herdr)), 0o755)
+    on_path = os.path.dirname(path) in os.environ.get("PATH", "").split(os.pathsep)
+    return True, "" if on_path else "Add ~/.local/bin to your PATH to run `nowplaying` in your shell."
+
+
+def herdr_version():
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", run([herdr_bin(), "--version"]))
+    return tuple(int(n) for n in m.groups()) if m else (0, 0, 0)
+
+
+def herdr_config_issues():
+    r = subprocess.run([herdr_bin(), "config", "check"], capture_output=True, text=True)
+    return {line.strip() for line in (r.stdout + r.stderr).splitlines()
+            if line.strip() and not line.startswith("config:")}
+
+
+def configure_herdr(player_key, controls, tab_bar, bottom):
+    """Edit herdr's config.toml (backed up first), validate with `herdr config check` and reload.
+    Rolls back if herdr reports anything new. Returns (actions bound, notes)."""
+    path = herdr_config_path()
+    before = read_text(path)
+    text, bound, skipped = add_keybindings(
+        before, (KEYBINDINGS["player"] if player_key else []) + (KEYBINDINGS["controls"] if controls else []))
+    notes = [f"{key} is already used in your herdr config, so setup didn't bind it." for key in skipped]
+    if tab_bar:
+        with_bar = add_tab_bar(text, BAR_COMMAND, bottom)
+        if with_bar is None:
+            notes.append("Couldn't add the tab bar: edit tab_bar_right yourself (see the README).")
+        else:
+            text = with_bar
+    if text == before:
+        return bound, notes
+    issues_before = herdr_config_issues()
+    backup = f"{path}.bak-nowplaying"
+    if before:
+        shutil.copy2(path, backup)
+    write_text(path, text)
+    new_issues = herdr_config_issues() - issues_before
+    if new_issues:
+        write_text(path, before) if before else os.remove(path)
+        return set(), notes + [f"herdr rejected the change ({sorted(new_issues)[0]}), so your config is unchanged."]
+    subprocess.run([herdr_bin(), "server", "reload-config"], capture_output=True)
+    if before:
+        notes.append(f"Your previous herdr config is saved as {backup.replace(home(), '~')}.")
+    if tab_bar and bottom:
+        notes.append("If the tab bar didn't move, choose reload config from herdr's menu.")
+    return bound, notes
+
+
+def copy_to_clipboard(text):
+    try:
+        return subprocess.run(["pbcopy"], input=text, text=True, capture_output=True).returncode == 0
+    except OSError:
+        return False
+
+
+def find_cargo():
+    cargo = shutil.which("cargo") or home(".cargo", "bin", "cargo")
+    return cargo if os.access(cargo, os.X_OK) else None
+
+
+class Setup:
+    """The first-run setup screens. run() returns True when the user wants the player next."""
+
+    def __init__(self, stdscr):
+        self.scr = stdscr
+        self.summary = []  # (ok, text) for the last screen
+
+    # drawing
+
+    def screen(self, title, lines, keys, notice="", progress=None):
+        scr = self.scr
+        scr.erase()
+        h, w = scr.getmaxyx()
+        put(scr, 0, 2, "♫ Now Playing · setup", curses.color_pair(1) | curses.A_BOLD)
+        put(scr, 2, 2, title, curses.A_BOLD)
+        y = 4
+        for line in lines:
+            text, attr = line if isinstance(line, tuple) else (line, 0)
+            indent = len(text) - len(text.lstrip())
+            for part in textwrap.wrap(text, max(20, w - 4 - indent), subsequent_indent=" " * (indent + 3)) or [""]:
+                if y < h - 3:
+                    put(scr, y, 2, part, attr)
+                y += 1
+        for line in progress or []:
+            if y < h - 3:
+                put(scr, y, 4, line, curses.A_DIM)
+            y += 1
+        put(scr, h - 2, 2, keys, curses.A_DIM)
+        if notice:
+            put(scr, h - 1, 2, notice, curses.color_pair(2) | curses.A_BOLD)
+        scr.refresh()
+
+    def key(self):
+        """Next key as a str ("\\n" for Enter, "esc" for Esc); ignores pasted text and escape sequences."""
+        while True:
+            k = self.scr.getch()
+            if k == -1:
+                continue
+            if k == 27:
+                seq = escape_sequence(self.scr, drop_paste=True)
+                if seq is None:
+                    return "esc"
+                if seq in ("A", "B"):
+                    return "up" if seq == "A" else "down"
+                continue
+            if k in (10, 13, curses.KEY_ENTER):
+                return "\n"
+            if k in (curses.KEY_UP, curses.KEY_DOWN):
+                return "up" if k == curses.KEY_UP else "down"
+            if 0 <= k < 256:
+                return chr(k).lower()
+
+    def ask(self, title, lines, keys, valid, notice=""):
+        while True:
+            self.screen(title, lines, keys, notice)
+            k = self.key()
+            if k in valid:
+                return k
+
+    def run_live(self, title, lines, argv, keys="[esc] cancel"):
+        """Run a command, showing its last lines. Returns (returncode, tail)."""
+        tail = deque(maxlen=6)
+        try:
+            proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True, errors="replace")
+        except OSError as e:
+            return 1, [str(e)]
+        reader = threading.Thread(target=lambda: [tail.append(l.rstrip()[:200]) for l in proc.stdout], daemon=True)
+        reader.start()
+        self.scr.timeout(250)
+        try:
+            while proc.poll() is None:
+                self.screen(title, lines, keys, progress=list(tail))
+                k = self.scr.getch()
+                if k == 27 and lone_escape(self.scr, drop_paste=True):
+                    proc.terminate()
+        finally:
+            self.scr.timeout(500)
+        reader.join(2)
+        return proc.wait(), list(tail)
+
+    # steps
+
+    def run(self):
+        sp = os.access(spotify_player_bin(), os.X_OK)
+        choice = self.ask("Welcome! Let's get you set up.", [
+            "Which player should play your music?",
+            "",
+            ("  [1] spotify_player" + ("  (installed)" if sp else ""), curses.A_BOLD),
+            "      Plays in the background; no Spotify app needed. Needs Spotify Premium.",
+            "",
+            ("  [2] Spotify desktop app", curses.A_BOLD),
+            "      Controls the Spotify app you already use. Free or Premium.",
+        ], "[1] [2] choose   [s] skip setup, I've set things up myself   [q] quit", "12sq")
+        if choice == "q":
+            return False
+        if choice == "s":
+            write_plugin_config({"backend": CONFIG["backend"]})
+            return True
+        if choice == "1":
+            if not (self.install_step() and self.client_id_step() and self.login_step()):
+                return False
+            backend = "spotify_player"
+        else:
+            backend = "applescript"
+            if not os.path.exists("/Applications/Spotify.app"):
+                self.summary.append((False, "The Spotify app isn't in /Applications; install it from spotify.com."))
+        if not self.extras_step(backend):
+            return False
+        return self.done_step(backend)
+
+    def install_step(self):
+        notice = ""
+        while not os.access(spotify_player_bin(), os.X_OK):
+            cargo = find_cargo()
+            if not cargo:
+                k = self.ask("Install Rust first", [
+                    "spotify_player is built from source with Rust, and Rust isn't installed.",
+                    f"Install it from {RUSTUP_URL} (one command in a terminal), then check again here.",
+                ], "[w] open rustup.rs   [r] check again   [q] quit", "wrq", notice)
+                if k == "w":
+                    open_url(RUSTUP_URL)
+                elif k == "q":
+                    return False
+                notice = "" if k == "w" else "Rust still isn't installed (no cargo found)."
+                continue
+            lines = ["spotify_player plays Spotify in the background. It isn't installed yet; setup can",
+                     "build it with Rust's cargo. It takes about 5 minutes.",
+                     "",
+                     ("cargo " + " ".join(CARGO_INSTALL), curses.A_DIM)]
+            k = self.ask("Install spotify_player", lines, "[enter] build it   [q] quit", "\nq", notice)
+            if k == "q":
+                return False
+            code, tail = self.run_live("Building spotify_player… (about 5 minutes)", lines, [cargo, *CARGO_INSTALL])
+            if code == 0:
+                self.summary.append((True, "Built spotify_player."))
+                continue
+            hint = " If it mentions the lock file version, run `rustup update` and retry." \
+                if any("lock file" in line for line in tail) else ""
+            k = self.ask("The build didn't finish", ["Last output:", *[("  " + line, curses.A_DIM) for line in tail],
+                                                     "", f"Fix the problem and retry.{hint}"],
+                         "[r] retry   [q] quit", "rq")
+            if k == "q":
+                return False
+            notice = ""
+        return True
+
+    def client_id_step(self):
+        client_id = current_client_id()
+        if client_id and client_id != NCSPOT_CLIENT_ID:
+            return True
+        copied = copy_to_clipboard(REDIRECT_URI)
+        lines = [
+            "Spotify asks every player to use its own free developer app. It takes about a minute:",
+            "",
+            "1. Press w to open the Spotify Developer Dashboard, log in and click Create app.",
+            "2. App name and description: anything, for example “herdr”.",
+            f"3. Redirect URI: {REDIRECT_URI}" + ("   (copied to your clipboard)" if copied else ""),
+            "4. Under the APIs you'll use, tick Web API. Agree to the terms and save.",
+            "5. Copy the Client ID (not the Client secret) and press enter to paste it here.",
+        ]
+        notice = ""
+        while True:
+            k = self.ask("Create your Spotify app", lines, "[w] open the dashboard   [enter] paste Client ID   [q] quit",
+                         "w\nq", notice)
+            if k == "w":
+                open_url(DASHBOARD_URL)
+                continue
+            if k == "q":
+                return False
+            self.screen("Create your Spotify app", lines, "[enter] save   [esc] back")
+            entered = read_query(self.scr, "Client ID: ")
+            if entered is None:
+                continue
+            entered = re.sub(r"\s", "", entered)
+            if not re.fullmatch(r"[0-9a-fA-F]{32}", entered):
+                notice = "That isn't a Client ID (it's 32 letters and digits). Try again."
+                continue
+            path = spotify_player_config_path()
+            write_text(path, spotify_player_config(read_text(path), entered.lower()))
+            # A running daemon still has the old settings; the login step starts it again.
+            subprocess.run(["pkill", "-f", "spotify_player -d"], capture_output=True)
+            self.summary.append((True, f"Saved your Client ID to {path.replace(home(), '~')}."))
+            return True
+
+    def login_step(self):
+        backend = SpotifyPlayerBackend(spotify_player_bin())
+        if not backend.missing_logins():
+            backend.start()
+            return True
+        lines = ["Your browser opens so you can log in to Spotify and allow your new app.",
+                 "spotify_player keeps two logins (streaming and Web API), so you may get two",
+                 "tabs. Approve each one."]
+        notice = ""
+        while True:
+            k = self.ask("Log in to Spotify", lines, "[enter] log in   [q] quit", "\nq", notice)
+            if k == "q":
+                return False
+            state = {"url": "", "ok": None}
+
+            def job():
+                state["ok"] = backend.login(on_url=lambda url: state.update(url=url))
+
+            threading.Thread(target=job, daemon=True).start()
+            self.scr.timeout(250)
+            try:
+                while state["ok"] is None:
+                    url = state["url"]
+                    self.screen("Approve the login in your browser…", [
+                        "Already-approved steps finish on their own; one tab may open per step.",
+                        "",
+                        *(["If no tab opened, press w or visit:", (url, curses.A_DIM)] if url else []),
+                    ], "[w] open the login page again   [esc] cancel")
+                    k = self.scr.getch()
+                    if k == ord("w") and url:
+                        open_url(url)
+                    elif k == 27 and lone_escape(self.scr, drop_paste=True):
+                        backend.cancel_login()
+            finally:
+                self.scr.timeout(500)
+            if state["ok"]:
+                self.summary.append((True, "Logged in to Spotify; spotify_player is running."))
+                return True
+            notice = "The login didn't finish. Try again."
+
+    def extras_step(self, backend):
+        herdr_text = read_text(herdr_config_path())
+        new_herdr = herdr_version() >= (0, 9, 0)
+
+        def has(command):
+            return f'"{PLUGIN_ID}.{command}"' in herdr_text
+
+        options = [  # id, label, on, available
+            ["autostart", "Start spotify_player when herdr starts", True, backend == "spotify_player"],
+            ["player_key", "prefix m opens the player" + ("  (already set)" if has("open-popup") else ""), True, True],
+            ["controls", "prefix , / space / . for previous / play-pause / next"
+             + ("  (already set)" if has("play-pause") else ""), True, True],
+            ["tab_bar", "Show what's playing in herdr's tab bar" + ("  (already set)" if "nowplaying bar" in herdr_text
+                                                                    else "" if new_herdr else "  (needs herdr 0.9.0+)"),
+             new_herdr, new_herdr],
+            ["bottom", "Put the tab bar at the bottom of the screen", False, new_herdr],
+        ]
+        options = [o for o in options if o[3]]
+        sel = 0
+        while True:
+            lines = ["Pick what to set up (prefix is your herdr prefix key, ctrl+b unless you changed it).",
+                     "Setup also installs the `nowplaying` command in ~/.local/bin.", ""]
+            for i, (_, label, on, _) in enumerate(options):
+                lines.append((f"{'›' if i == sel else ' '} [{'x' if on else ' '}] {label}",
+                              curses.A_BOLD if i == sel else 0))
+            self.screen("Extras", lines, "↑/↓ move   space toggle   enter apply   q quit")
+            k = self.key()
+            if k in ("up", "k"):
+                sel = (sel - 1) % len(options)
+            elif k in ("down", "j"):
+                sel = (sel + 1) % len(options)
+            elif k == " ":
+                options[sel][2] = not options[sel][2]
+            elif k == "q":
+                return False
+            elif k == "\n":
+                break
+        chosen = {o[0]: o[2] for o in options}
+
+        self.screen("Applying…", [], "")
+        ok, note = install_launcher()
+        self.summary.append((ok, "Installed the `nowplaying` command." if ok else note))
+        if ok and note:
+            self.summary.append((False, note))
+        bound, notes = configure_herdr(chosen.get("player_key", False), chosen.get("controls", False),
+                                       chosen.get("tab_bar", False), chosen.get("bottom", False))
+        if "open-popup" in bound:
+            self.summary.append((True, "prefix m opens the player."))
+        if bound & set(BAR_KEYS):
+            self.summary.append((True, "prefix , / space / . control playback."))
+        if chosen.get("tab_bar") and not any("tab bar" in n or "rejected" in n for n in notes):
+            self.summary.append((True, "What's playing shows in herdr's tab bar."))
+        self.summary += [(False, n) for n in notes]
+        values = {"backend": backend, "autostart_player": chosen.get("autostart", False),
+                  "bar_controls": bool(bound & set(BAR_KEYS))}
+        for action, key in BAR_KEYS.items():  # hint only keys that are really bound
+            values[key] = DEFAULTS[key] if action in bound else ""
+        write_plugin_config(values)
+        return True
+
+    def done_step(self, backend):
+        lines = [(("✓ " if ok else "! ") + text, 0 if ok else curses.color_pair(2)) for ok, text in self.summary]
+        if backend == "spotify_player":
+            lines += ["", "To start music: open the player and press / to search, or t to move what's",
+                      "playing on another device (your phone, the Spotify app) to “herdr”."]
+        k = self.ask("You're all set", lines, "[enter] open the player   [q] close", "\nq")
+        return k == "\n"
+
+
 # --- CLI ---------------------------------------------------------------------------------------
 
 USAGE = """usage: nowplaying [command]
@@ -975,7 +1544,8 @@ USAGE = """usage: nowplaying [command]
   search [--play] <query>
                   search Spotify (spotify_player); --play starts the top track
   login           log in to Spotify (opens your browser), then start the daemon
-  daemon          start the spotify_player daemon if it isn't running"""
+  daemon          start the spotify_player daemon if it isn't running
+  setup           set everything up step by step (also runs the first time you open the player)"""
 
 
 def run_with_recovery(backend, do):
@@ -1012,6 +1582,8 @@ def open_pane(entrypoint):
             return
         # The player lives in another workspace: bring it here instead of jumping there.
         subprocess.run([herdr, "pane", "close", p["pane_id"]], capture_output=True)
+    if needs_setup() and entrypoint == "player":
+        entrypoint = "setup"  # first run: the setup popup is bigger than the player's
     argv = [herdr, "plugin", "pane", "open", "--plugin", PLUGIN_ID, "--entrypoint", entrypoint]
     caller = os.environ.get("HERDR_PANE_ID")
     if entrypoint == "player-split" and caller:
@@ -1046,8 +1618,20 @@ def main():
         if backend.missing_logins():
             sys.exit("Not logged in to Spotify yet. Run: nowplaying login")
         backend.start()
-    elif cmd == "startup":  # herdr [[startup]] hook: one-shot, opt-in via config
-        if CONFIG["autostart_player"]:
+    elif cmd in ("setup", "setup-ui"):
+        if cmd == "setup" and os.environ.get("HERDR_ENV") and not sys.stdin.isatty():
+            # Invoked as a plugin action: there's no terminal here, so show setup in a popup.
+            r = subprocess.run([herdr_bin(), "plugin", "pane", "open", "--plugin", PLUGIN_ID, "--entrypoint", "setup"],
+                               capture_output=True, text=True)
+            if r.returncode:
+                sys.exit(r.stderr.strip() or r.stdout.strip())
+        else:
+            curses.wrapper(ui, True)
+    elif cmd == "startup":  # herdr [[startup]] hook: one-shot
+        if needs_setup():
+            run([herdr_bin(), "notification", "show", "Now Playing: finish setting up",
+                 "--body", f"Run: herdr plugin action invoke {PLUGIN_ID}.setup", "--sound", "none"])
+        elif CONFIG["autostart_player"]:
             backend = pick_backend()
             if backend.missing_logins():
                 run([herdr_bin(), "notification", "show", "Now Playing: not logged in to Spotify",
