@@ -9,3 +9,10 @@ spotify_player_bin = ""
 
 # Start the spotify_player daemon when the herdr server starts
 autostart_player = false
+
+# `nowplaying bar` (herdr's tab bar): key hints shown before the track.
+# Match them to your key bindings; "" hides one, bar_controls = false hides all.
+bar_controls = true
+bar_key_previous = ","
+bar_key_play_pause = "Space"
+bar_key_next = "."

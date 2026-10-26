@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0 — 2026-10-22
+
+### Added
+- `nowplaying bar`: a one-line status (control key hints, track, artist, position) for herdr's tab
+  bar via a `ui.tab_bar_right` command entry (herdr 0.9.0+). Prints nothing when nothing is playing,
+  and only reads state, so frequent polling never starts or restarts `spotify_player`.
+- `bar_controls` and `bar_key_*` settings to match the hints to your key bindings.
+
 ## 0.2.2 — 2026-10-08
 
 ### Fixed

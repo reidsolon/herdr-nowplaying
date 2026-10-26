@@ -32,6 +32,10 @@ DEFAULTS = {
     "backend": "auto",            # auto | spotify_player | applescript
     "spotify_player_bin": "",     # empty = find on PATH or ~/.cargo/bin
     "autostart_player": False,    # start the spotify_player daemon when the herdr server starts
+    "bar_controls": True,         # `nowplaying bar`: show key hints before the track
+    "bar_key_previous": ",",      # hint text for each control; "" hides that hint
+    "bar_key_play_pause": "Space",
+    "bar_key_next": ".",
 }
 
 
@@ -193,15 +197,22 @@ class SpotifyPlayerBackend:
         self.last_restart = 0.0
         self.ensure_ready()
 
-    def status(self):
+    def status(self, heal=True):
         missing = self.missing_logins()
         if missing:
             return {"state": "NOT_AUTHENTICATED", "missing": missing}
+        if not heal:
+            # Read-only (the tab bar polls from a fresh process each time, so it has no restart backoff).
+            if not self.control_reachable():
+                return {"state": "NOT_RUNNING"}
+            out = run([self.bin, "get", "key", "playback"])
         # Polling never starts a stopped daemon, but it does heal a running one that went deaf.
-        if not self.ensure_ready(start_if_stopped=False):
+        elif not self.ensure_ready(start_if_stopped=False):
             return {"state": "NOT_RUNNING"}
+        else:
+            out = self.cli("get", "key", "playback")
         try:
-            d = json.loads(self.cli("get", "key", "playback") or "null")
+            d = json.loads(out or "null")
         except json.JSONDecodeError:
             d = None
         item = (d or {}).get("item")
@@ -356,7 +367,7 @@ class AppleScriptBackend:
     def start(self):
         subprocess.run(["open", "-g", "-a", "Spotify"])
 
-    def status(self):
+    def status(self, heal=True):
         out = run(["osascript", "-e", self.STATUS_SCRIPT])
         if out in ("NOT_RUNNING", "NO_TRACK", ""):
             return {"state": out or "NOT_RUNNING"}
@@ -457,6 +468,30 @@ def state_icon(s):
 def fmt(secs):
     secs = max(0, int(secs))
     return f"{secs // 60}:{secs % 60:02d}"
+
+
+def clip(text, limit):
+    text = " ".join("".join(c if c.isprintable() else " " for c in str(text)).split())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def bar_line(s):
+    """One line for herdr's tab bar (a `ui.tab_bar_right` command entry). Empty output hides the entry."""
+    if s["state"] == "NOT_AUTHENTICATED":
+        return "Spotify · not logged in: nowplaying login"
+    if s["state"] not in ("playing", "paused"):
+        return ""
+    track = clip(s["name"], 28)
+    if s.get("artist"):
+        track += " — " + clip(s["artist"], 20)
+    track += f" · {fmt(s['position'])} / {fmt(s['duration'])}"
+    if not CONFIG["bar_controls"]:
+        return track
+    hints = [("⏮", CONFIG["bar_key_previous"]),
+             ("⏸" if s["state"] == "playing" else "▶", CONFIG["bar_key_play_pause"]),
+             ("⏭", CONFIG["bar_key_next"])]
+    controls = "   ".join(f"{icon} {key}" for icon, key in hints if key)
+    return f"{controls}  │  {track}" if controls else track
 
 
 def put(win, y, x, text, attr=0):
@@ -936,6 +971,7 @@ USAGE = """usage: nowplaying [command]
   here            move playback to the spotify_player device
   now             print what's playing
   web             open the current track in Spotify
+  bar             one-line status for herdr's tab bar (ui.tab_bar_right)
   search [--play] <query>
                   search Spotify (spotify_player); --play starts the top track
   login           log in to Spotify (opens your browser), then start the daemon
@@ -1018,6 +1054,8 @@ def main():
                      "--body", "Open the player and press a, or run: nowplaying login", "--sound", "none"])
             else:
                 backend.start()
+    elif cmd == "bar":
+        print(bar_line(pick_backend().status(heal=False)))
     elif cmd in ("now", "web"):
         s = pick_backend().status()
         if s["state"] not in ("playing", "paused"):

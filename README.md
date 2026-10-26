@@ -5,6 +5,7 @@ See and control what's playing on Spotify without leaving [herdr](https://herdr.
 - **Player pane**: track, artist, album, progress, volume, shuffle/repeat, with keyboard controls
 - **Search**: find tracks, albums, artists and playlists and play them, from the pane or the CLI
 - **Agents panel**: the player pane shows up as an agent, titled with the current track
+- **Tab bar**: track, progress and control hints on the right of herdr's tab row (herdr 0.9.0+)
 - **CLI**: `nowplaying next`, `nowplaying now`, … for scripts and key bindings
 
 <p>
@@ -19,7 +20,7 @@ See and control what's playing on Spotify without leaving [herdr](https://herdr.
 
 ## Requirements
 
-- herdr 0.7.5 or newer, macOS
+- herdr 0.7.5 or newer, macOS (the tab bar line needs herdr 0.9.0+)
 - Python 3.9+ (the system `python3` works; standard library only)
 - One playback backend:
 
@@ -36,7 +37,7 @@ The plugin picks `spotify_player` if it is installed, otherwise the Spotify app.
 ```sh
 herdr plugin install reidsolon/herdr-nowplaying
 # or pin a release
-herdr plugin install reidsolon/herdr-nowplaying --ref v0.2.2
+herdr plugin install reidsolon/herdr-nowplaying --ref v0.3.0
 ```
 
 Optional: put the `nowplaying` command on your PATH.
@@ -101,6 +102,7 @@ nowplaying            open the player (split pane; switches to it if already ope
 nowplaying popup      open the player as a popup
 nowplaying play       play/pause            nowplaying next | prev   skip
 nowplaying now        print what's playing  nowplaying web           open track in Spotify
+nowplaying bar        one-line status for herdr's tab bar
 nowplaying here       move playback to the spotify_player device
 nowplaying search <query>          list tracks, albums, artists, playlists
 nowplaying search --play <query>   play the top track
@@ -146,6 +148,50 @@ command = "reidsolon.nowplaying.next"
 description = "next track"
 ```
 
+### Tab bar (herdr 0.9.0+)
+
+Show what's playing on the right of herdr's tab row:
+
+```text
+[1] [+]          ⏮ ,   ⏸ Space   ⏭ .  │  Track — Artist · 1:24 / 3:52
+```
+
+Add this to `~/.config/herdr/config.toml` (merge into an existing `[ui]` section and
+`tab_bar_right` list rather than duplicating them), then reload herdr's config from the menu:
+
+```toml
+[ui]
+tab_bar_position = "bottom"            # optional; the default is "top"
+hide_tab_bar_when_single_tab = false   # keep it visible with one tab
+tab_bar_right = [
+  { type = "command", command = "~/.local/bin/nowplaying bar", interval_seconds = 5, timeout_seconds = 4 },
+]
+
+[[keys.command]]
+key = "prefix+comma"
+type = "plugin_action"
+command = "reidsolon.nowplaying.previous"
+description = "previous track"
+
+[[keys.command]]
+key = "prefix+space"
+type = "plugin_action"
+command = "reidsolon.nowplaying.play-pause"
+description = "play / pause"
+
+[[keys.command]]
+key = "prefix+period"
+type = "plugin_action"
+command = "reidsolon.nowplaying.next"
+description = "next track"
+```
+
+The command needs the `nowplaying` symlink from [Install](#install). The hints in the bar are text,
+not buttons: they show the keys above. Change them with the `bar_*` settings below, or hide them
+with `bar_controls = false`. The bar hides itself when nothing is playing, and the time refreshes on
+each poll rather than ticking. The bar only reads playback state; it never starts or restarts
+`spotify_player`. Each poll is one Spotify Web API request, so keep the interval at a few seconds.
+
 ## Configuration
 
 Copy [`config.example.toml`](config.example.toml) to the plugin config directory
@@ -156,6 +202,10 @@ Copy [`config.example.toml`](config.example.toml) to the plugin config directory
 | `backend` | `"auto"` | `auto`, `spotify_player` or `applescript` |
 | `spotify_player_bin` | `""` | path if not on PATH or in `~/.cargo/bin` |
 | `autostart_player` | `false` | start the spotify_player daemon when the herdr server starts |
+| `bar_controls` | `true` | show key hints before the track in `nowplaying bar` |
+| `bar_key_previous` | `","` | hint for previous; `""` hides it |
+| `bar_key_play_pause` | `"Space"` | hint for play/pause; `""` hides it |
+| `bar_key_next` | `"."` | hint for next; `""` hides it |
 
 ## Privacy
 
