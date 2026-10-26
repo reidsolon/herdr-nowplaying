@@ -1551,9 +1551,14 @@ class Setup:
         if not backend.missing_logins():
             backend.start()
             return True
-        lines = ["Your browser opens so you can log in to Spotify and allow access.",
-                 "spotify_player needs up to three logins (your app, ncspot's app as its backup,",
-                 "and streaming), so up to three tabs open, one after another. Approve each one."]
+        lines = ["Your browser opens up to three Spotify pages, one after another. Approve each:",
+                 "",
+                 "1. Your app (the one you just created): playback, search and controls.",
+                 "2. ncspot: spotify_player's backup for a few features Spotify restricts for new",
+                 "   personal apps, such as reading your playlists. This is expected.",
+                 "3. Spotify: the streaming login that plays the audio.",
+                 "",
+                 ("Pages you've approved before finish on their own.", curses.A_DIM)]
         notice = ""
         while True:
             k = self.ask("Log in to Spotify", lines, "[enter] log in   [q] quit", "\nq", notice)

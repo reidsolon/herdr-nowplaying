@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.2 — 2026-10-26
+
+### Changed
+- Setup's login screen names the three Spotify pages you approve (your app, ncspot, streaming) and
+  explains why ncspot's appears, so it doesn't look like your Client ID was ignored.
+
 ## 0.4.1 — 2026-10-26
 
 ### Fixed
