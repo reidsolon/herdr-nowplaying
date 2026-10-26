@@ -9,13 +9,16 @@ Backends:
 
 Python 3.9+ standard library only.
 """
+import base64
 import curses
 import datetime
 import glob
+import hashlib
 import json
 import os
 import queue
 import re
+import secrets
 import shlex
 import shutil
 import socket
@@ -25,6 +28,7 @@ import textwrap
 import threading
 import time
 import urllib.parse
+import urllib.request
 from collections import deque
 
 PLUGIN_ID = os.environ.get("HERDR_PLUGIN_ID", "reidsolon.nowplaying")
@@ -87,10 +91,21 @@ def run(argv):
 
 def open_url(url):
     if url:
-        subprocess.run(["open" if sys.platform == "darwin" else "xdg-open", url], capture_output=True)
+        # Discard output rather than capture it: capturing waits for anything the opener left running.
+        subprocess.run(["open" if sys.platform == "darwin" else "xdg-open", url], stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 NCSPOT_CLIENT_ID = "d420a117a32841c2b3474932e49fb54b"  # spotify_player's default Web API client
+# ncspot's app only accepts this redirect since ncspot 2026-09-28 ("Separate ncspot from Spotify login"),
+# but spotify_player 0.25.1 still asks it for http://127.0.0.1:8989/login, so its `authenticate` fails
+# with "redirect_uri: Not matching configuration". The plugin does that one login itself.
+NCSPOT_REDIRECT_URI = "http://127.0.0.1:8989/ncspot_login"
+NCSPOT_SCOPES = ("playlist-read-collaborative user-read-recently-played user-read-playback-position "
+                 "user-read-currently-playing app-remote-control playlist-modify-public playlist-modify-private "
+                 "user-follow-read user-library-read streaming user-top-read user-follow-modify "
+                 "user-read-playback-state playlist-read-private user-modify-playback-state user-library-modify")
+SPOTIFY_ACCOUNTS = os.environ.get("NOWPLAYING_SPOTIFY_ACCOUNTS", "https://accounts.spotify.com")  # overridable for tests
 
 
 class SpotifyPlayerBackend:
@@ -108,6 +123,7 @@ class SpotifyPlayerBackend:
         self.cache_dir = os.path.expanduser("~/.cache/spotify-player")
         self.client_port = int(sp_config.get("client_port") or 8080)
         self.login_proc = None
+        self.login_cancelled = False
         self.heal_lock = threading.Lock()
         # None = never. Not 0.0: on Python 3.9 macOS, time.monotonic() starts near 0 with the process.
         self.last_restart = None
@@ -166,34 +182,144 @@ class SpotifyPlayerBackend:
                 time.sleep(0.125)
             return False
 
+    def token_path(self, client_id):
+        return os.path.join(self.cache_dir, f"{client_id}_token.json")
+
     def missing_logins(self):
-        """spotify_player keeps two logins: librespot credentials for streaming and a Web API token
-        per client id. Either one missing means it can't work until the user logs in."""
+        """spotify_player keeps up to three logins: librespot credentials for streaming, a Web API
+        token for the configured client id, and (with your own client id) a token for ncspot's app,
+        its backup for a few endpoints. Any one missing means it can't work until the user logs in."""
         missing = []
         if not os.path.exists(os.path.join(self.cache_dir, "credentials.json")):
             missing.append("streaming")
-        if not os.path.exists(os.path.join(self.cache_dir, f"{self.client_id}_token.json")):
+        if not os.path.exists(self.token_path(self.client_id)):
             missing.append("Web API")
+        if self.client_id != NCSPOT_CLIENT_ID and not os.path.exists(self.token_path(NCSPOT_CLIENT_ID)):
+            missing.append("backup Web API")
         return missing
 
     def login(self, on_url=lambda url: None):
-        """Runs `spotify_player authenticate`, which opens a browser tab per login and waits for the
-        redirect to 127.0.0.1. Returns True once everything is logged in and the daemon is up."""
+        """Log in to whatever is missing; one browser tab per login. Returns True once everything is
+        logged in and the daemon is up.
+
+        Not `spotify_player authenticate`: it always redoes ncspot's login with a redirect URI that
+        ncspot's app rejects. Instead this does ncspot's login itself, then runs spotify_player
+        normally, which only asks for the logins it doesn't have yet."""
+        self.login_cancelled = False
         # A daemon started without a login sits on the callback port waiting for one; stop it first.
         subprocess.run(["pkill", "-f", "spotify_player -d"], capture_output=True)
-        self.login_proc = subprocess.Popen([self.bin, "authenticate"], stdin=subprocess.DEVNULL,
-                                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        for line in self.login_proc.stdout:
-            m = re.search(r"Browse to: (\S+)", line)
-            if m:
-                on_url(m.group(1))
-        ok = self.login_proc.wait() == 0 and not self.missing_logins()
-        self.login_proc = None
+        if "backup Web API" in self.missing_logins() and not self.ncspot_login(on_url):
+            return False
+        if self.missing_logins():
+            self.run_until_logged_in(on_url)
+        ok = not self.missing_logins() and not self.login_cancelled
         if ok:
             self.start()
         return ok
 
+    def run_until_logged_in(self, on_url):
+        """Run spotify_player in the foreground: on start it logs in to anything missing (printing
+        "Browse to: <url>"), then would carry on into its UI, so stop it once the logins exist."""
+        self.login_proc = proc = subprocess.Popen([self.bin], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                                  stderr=subprocess.STDOUT, text=True, errors="replace")
+
+        def read():
+            for line in proc.stdout:
+                m = re.search(r"Browse to: (\S+)", line)
+                if m:
+                    on_url(m.group(1))
+        threading.Thread(target=read, daemon=True).start()
+        try:
+            while proc.poll() is None and self.missing_logins() and not self.login_cancelled:
+                time.sleep(0.2)
+            if proc.poll() is None:
+                time.sleep(0.5)  # let it finish writing the last login
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            self.login_proc = None
+
+    def ncspot_login(self, on_url):
+        """Authorization code + PKCE login for ncspot's app on the redirect URI it accepts, saving the
+        token where spotify_player reads it (it refreshes the token itself from then on)."""
+        verifier = secrets.token_urlsafe(64)
+        challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+        state = secrets.token_urlsafe(16)
+        url = f"{SPOTIFY_ACCOUNTS}/authorize?" + urllib.parse.urlencode({
+            "client_id": NCSPOT_CLIENT_ID, "response_type": "code", "redirect_uri": NCSPOT_REDIRECT_URI,
+            "code_challenge_method": "S256", "code_challenge": challenge, "state": state, "scope": NCSPOT_SCOPES})
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            parsed = urllib.parse.urlparse(NCSPOT_REDIRECT_URI)
+            listener.bind((parsed.hostname, parsed.port))
+            listener.listen(8)
+            listener.settimeout(0.3)
+        except OSError:
+            listener.close()
+            return False
+        open_url(url)
+        on_url(url)
+        code, deadline = None, time.monotonic() + 600
+        try:
+            while code is None and not self.login_cancelled and time.monotonic() < deadline:
+                try:
+                    conn, _ = listener.accept()
+                except socket.timeout:
+                    continue
+                with conn:
+                    conn.settimeout(2)
+                    try:
+                        target = conn.recv(8192).decode("latin-1").split(" ")[1]
+                    except (OSError, IndexError):
+                        continue
+                    query = urllib.parse.parse_qs(urllib.parse.urlparse(target).query)
+                    if urllib.parse.urlparse(target).path != parsed.path or query.get("state") != [state]:
+                        conn.sendall(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                        continue  # browser prefetches (favicon) and stray requests
+                    ok = "code" in query
+                    body = ("Logged in. You can close this tab and go back to herdr." if ok
+                            else f"Spotify login failed: {query.get('error', ['unknown'])[0]}. Go back to herdr and try again.")
+                    conn.sendall(f"HTTP/1.1 200 OK\r\ncontent-type: text/plain; charset=utf-8\r\n"
+                                 f"content-length: {len(body.encode())}\r\nconnection: close\r\n\r\n{body}".encode())
+                    if not ok:
+                        return False
+                    code = query["code"][0]
+        finally:
+            listener.close()
+        if code is None:
+            return False
+        try:
+            token = self.exchange_code(code, verifier, NCSPOT_REDIRECT_URI)
+        except (OSError, ValueError):
+            return False
+        expires_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=token["expires_in"])
+        path = self.token_path(NCSPOT_CLIENT_ID)
+        os.makedirs(self.cache_dir, exist_ok=True)
+        tmp = f"{path}.tmp"
+        with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+            json.dump({"access_token": token["access_token"], "expires_in": token["expires_in"],
+                       "expires_at": expires_at.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                       "refresh_token": token.get("refresh_token"), "scope": token.get("scope", NCSPOT_SCOPES)}, f)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+        return True
+
+    @staticmethod
+    def exchange_code(code, verifier, redirect_uri):
+        data = urllib.parse.urlencode({"grant_type": "authorization_code", "code": code, "redirect_uri": redirect_uri,
+                                       "client_id": NCSPOT_CLIENT_ID, "code_verifier": verifier}).encode()
+        req = urllib.request.Request(f"{SPOTIFY_ACCOUNTS}/api/token", data=data,
+                                     headers={"Content-Type": "application/x-www-form-urlencoded"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.loads(r.read())
+
     def cancel_login(self):
+        self.login_cancelled = True
         if self.login_proc:
             self.login_proc.terminate()
 
@@ -1425,9 +1551,9 @@ class Setup:
         if not backend.missing_logins():
             backend.start()
             return True
-        lines = ["Your browser opens so you can log in to Spotify and allow your new app.",
-                 "spotify_player keeps two logins (streaming and Web API), so you may get two",
-                 "tabs. Approve each one."]
+        lines = ["Your browser opens so you can log in to Spotify and allow access.",
+                 "spotify_player needs up to three logins (your app, ncspot's app as its backup,",
+                 "and streaming), so up to three tabs open, one after another. Approve each one."]
         notice = ""
         while True:
             k = self.ask("Log in to Spotify", lines, "[enter] log in   [q] quit", "\nq", notice)

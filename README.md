@@ -195,7 +195,7 @@ This plugin collects nothing and makes no network requests of its own.
 
 - **No credentials are shipped.** Each user registers their own client ID, as the
   [Spotify Developer Policy](https://developer.spotify.com/policy) requires one set of credentials per app.
-- **Premium** is required by Spotify for playback through third-party players (Option B).
+- **Premium** is required by Spotify for playback through third-party players (the spotify_player option).
 - **`spotify_player` is not part of this plugin.** It is a separate MIT-licensed project built on
   [librespot](https://github.com/librespot-org/librespot), an unofficial Spotify client
   library. You install and run it yourself; review its terms and Spotify's
@@ -210,7 +210,7 @@ This plugin collects nothing and makes no network requests of its own.
 ## Troubleshooting
 
 - **Controls lag or do nothing, the pane says "rate-limited (429)"**: you're on the shared default
-  client ID. Set your own `client_id` (Option B, steps 2–3), then press `a` in the player or run `nowplaying login`.
+  client ID. Set your own `client_id` (run `nowplaying setup`, or see Manual setup), then press `a` in the player or run `nowplaying login`.
 - **Paused at 0:00 after a while**: `spotify_player` lost its connection to Spotify and reconnected
   paused. Run `nowplaying play`.
 - **"Spotify lost the player device; reconnecting…"**: after sleep or a network change,
@@ -220,10 +220,14 @@ This plugin collects nothing and makes no network requests of its own.
 - **"spotify_player had stopped responding; restarted it."**: the daemon was still connected to
   Spotify but had stopped accepting commands (it happens after long uptimes). The plugin restarted
   it; press play again.
-- **"player not running"**: `nowplaying daemon` (Option B), or open the Spotify app (Option A).
+- **"player not running"**: `nowplaying daemon` (spotify_player), or open the Spotify app.
 - **"Not logged in to Spotify"**: press `a` in the player or run `nowplaying login`. If the browser
   shows `INVALID_CLIENT: Invalid redirect URI`, add exactly `http://127.0.0.1:8989/login` to your
   app's Redirect URIs in the Spotify dashboard.
+- **`redirect_uri: Not matching configuration` with `client_id=d420a117…` in the address bar**:
+  that's ncspot's app, which `spotify_player authenticate` asks for an outdated redirect URI. Log in
+  through the plugin instead (`a` in the player, `nowplaying login` or setup); it uses the address
+  ncspot's app accepts. With your own `client_id=` in the address bar, see the entry above.
 - **Logs**: `~/.cache/spotify-player/*.log`, `herdr plugin log list`.
 
 ## Manual setup
@@ -280,8 +284,10 @@ playback). macOS will ask once to let herdr control Spotify.
    ```
 
    The player notices when you're logged out (first run, a new client ID, an expired token) and
-   asks you to log in instead of failing silently. `spotify_player` keeps two logins (streaming and
-   Web API) and opens one browser tab per step; steps you've approved before finish on their own.
+   asks you to log in instead of failing silently. `spotify_player` needs up to three logins (your
+   app, ncspot's app as its backup, and streaming), one browser tab each; steps you've approved
+   before finish on their own. The plugin doesn't use `spotify_player authenticate`: in 0.25.1 it asks
+   ncspot's app for a redirect URI that app no longer accepts, so the plugin does that login itself.
 
 ## Development
 

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.1 — 2026-10-26
+
+### Fixed
+- Logging in failed with `redirect_uri: Not matching configuration` on ncspot's page. With your own
+  client ID, `spotify_player` also logs in to ncspot's app as a backup, and since ncspot's
+  2026-09-28 release that app only accepts `/ncspot_login` as its redirect, while
+  `spotify_player` 0.25.1 still sends `/login`. The plugin no longer runs
+  `spotify_player authenticate`. It does the ncspot login itself (PKCE, on the address ncspot's
+  app accepts) and saves the token where `spotify_player` reads and refreshes it. Then it runs
+  `spotify_player` normally, which only asks for the logins it's missing.
+- Opening a link no longer waits for the opener's output.
+
 ## 0.4.0 — 2026-10-26
 
 ### Added
