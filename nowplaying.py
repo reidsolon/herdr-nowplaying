@@ -907,12 +907,19 @@ class Session:
     def command(self, action, amount=0):
         with self.lock:
             s, now = self.status, time.monotonic()
+            # Spotify answers 403 for repeat on a track played on its own, and spotify_player then retries
+            # with ncspot's shared app, which is nearly always rate-limited. Don't send it at all.
+            lone_track = (action == "repeat" and isinstance(self.backend, SpotifyPlayerBackend)
+                          and s.get("state") in ("playing", "paused") and not s.get("context"))
             if action == "playpause" and s.get("state") in ("playing", "paused"):
                 position = s["position"] + (now - self.status_at if s["state"] == "playing" else 0)
                 self.status = dict(s, state="paused" if s["state"] == "playing" else "playing", position=position)
                 self.status_at = now
             elif action == "volume" and "volume" in s:
                 self.status = dict(s, volume=max(0, min(100, amount)))
+        if lone_track:
+            self.say("Repeat needs an album or playlist. Play one, not a single track.")
+            return
 
         def job():
             sent = time.time()
@@ -941,6 +948,9 @@ class Session:
         errors = self._errors_since(sent)
         if 404 in errors and self._reconnect():
             self.jobs.put(lambda: (self.backend.command(action, amount), self.refresh(0.3)))
+        elif 403 in errors:
+            # The 429 that usually follows is the ncspot retry, not the real reason.
+            self.say("Spotify doesn't allow that for what's playing (403).")
         elif 429 in errors:
             self.say("Spotify rate-limited that request (429). Try again shortly.")
 

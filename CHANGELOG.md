@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.3 — 2026-10-26
+
+### Fixed
+- Pressing `r` (repeat) on a track played on its own from search showed "rate-limited (429)". Spotify
+  refuses repeat there (403), and spotify_player then retries with ncspot's shared app, which is
+  nearly always rate-limited. Repeat is now skipped with a short explanation, and a refused request
+  shows the real reason (403) instead of the ncspot retry's 429.
+
 ## 0.4.2 — 2026-10-26
 
 ### Changed
